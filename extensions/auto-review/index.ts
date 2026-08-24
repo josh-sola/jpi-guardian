@@ -1,16 +1,13 @@
 import { randomUUID } from "node:crypto";
-import { readFile } from "node:fs/promises";
-import { join } from "node:path";
 
 import type { AssistantMessage, ToolResultMessage, Usage } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ToolCallEvent, ToolCallEventResult, ToolResultEvent, ToolResultEventResult } from "@earendil-works/pi-coding-agent";
-import { getAgentDirectory, loadJsonConfig } from "jpi-base";
+import { Config, j } from "jpi-base";
 
 import { REVIEW_POLICY } from "./policy.ts";
 
 const COMMAND_NAME = "auto-review";
 const STATUS_KEY = "auto-review";
-const DEFAULT_TIMEOUT_MS = 10_000;
 const MAX_REVIEW_TOKENS = 220;
 const MAX_TOOL_ARGS_CHARS = 4_000;
 const MAX_TRANSCRIPT_CHARS = 4_000;
@@ -21,6 +18,38 @@ const MAX_JSON_KEYS = 40;
 const MAX_JSON_ITEMS = 20;
 const MAX_JSON_STRING = 4_000;
 const MAX_REASON_CHARS = 220;
+
+const guardianSchema = j.node({
+  fields: {
+    model: j.string()
+      .describe("model that runs the reviews")
+      .default("anthropic/claude-sonnet-5"),
+    enabled: j.boolean()
+      .describe("set to #false to disable reviews")
+      .default(true),
+    timeoutMs: j.number().int().positive()
+      .describe("per-review timeout in milliseconds")
+      .default(10_000),
+    allow: j.node({
+      fields: {
+        tool: j.list(j.string(), {
+          description: 'tool names that skip review (repeat: tool "name")',
+          default: [],
+        }),
+        bash: j.list(j.string(), {
+          description: "regexes; a full command match skips review",
+          default: [],
+        }),
+      },
+    }),
+    policy: j.list(j.string(), {
+      description: "extra review policy lines",
+      default: [],
+    }),
+  },
+});
+
+type GuardianConfigValue = j.infer<typeof guardianSchema>;
 
 type ReviewerModelSpec = {
   raw: string;
@@ -90,8 +119,8 @@ type ReviewCommandContext = ReviewContext & {
 };
 
 type ControllerOptions = {
-  configPath?: string;
-  readTextFile?: (path: string) => Promise<string>;
+  env?: NodeJS.ProcessEnv;
+  homeDirectory?: string;
   now?: () => number;
   createSessionId?: () => string;
 };
@@ -100,17 +129,6 @@ type ReviewerDecision = {
   decision: "allow" | "deny";
   reason: string;
 };
-
-function defaultConfig(path: string): ReviewConfig {
-  return {
-    path,
-    enabled: true,
-    allowTools: [],
-    allowBash: [],
-    policy: [],
-    timeoutMs: DEFAULT_TIMEOUT_MS,
-  };
-}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
@@ -141,10 +159,6 @@ function normalizeReason(value: string): string {
   return truncateInline(value.replace(/\s+/g, " ").trim(), MAX_REASON_CHARS);
 }
 
-export function getReviewConfigPath(env: NodeJS.ProcessEnv = process.env): string {
-  return join(getAgentDirectory(env), "review.json");
-}
-
 export function parseReviewerModel(value: unknown): ReviewerModelSpec | undefined {
   if (typeof value !== "string") return undefined;
   const raw = value.trim();
@@ -158,99 +172,29 @@ export function parseReviewerModel(value: unknown): ReviewerModelSpec | undefine
   return { raw, provider, modelId };
 }
 
-function readStringArray(value: unknown, path: string, issues: string[]): string[] {
-  if (value === undefined) return [];
-  if (!Array.isArray(value)) {
-    issues.push(`${path} must be an array of strings`);
-    return [];
-  }
+function mapConfigValue(value: GuardianConfigValue, path: string, issues: string[]): ReviewConfig {
+  const model = parseReviewerModel(value.model);
+  if (!model) issues.push('model must be set to "provider/model-id"');
 
-  const items: string[] = [];
-  for (let index = 0; index < value.length; index += 1) {
-    const item = value[index];
-    if (typeof item !== "string" || item.trim() === "") {
-      issues.push(`${path}[${index}] must be a non-empty string`);
-      continue;
-    }
-    items.push(item.trim());
-  }
-
-  return [...new Set(items)];
-}
-
-export function parseReviewConfigText(rawText: string, path: string): ReviewConfigState {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(rawText);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    return { config: defaultConfig(path), issues: [`invalid JSON: ${message}`] };
-  }
-
-  return parseReviewConfigValue(parsed, path);
-}
-
-function parseReviewConfigValue(parsed: unknown, path: string): ReviewConfigState {
-  const issues: string[] = [];
-  const config = defaultConfig(path);
-
-  if (!isRecord(parsed)) {
-    issues.push("review.json must contain a JSON object");
-    return { config, issues };
-  }
-
-  if ("enabled" in parsed) {
-    if (typeof parsed.enabled === "boolean") config.enabled = parsed.enabled;
-    else issues.push("enabled must be true or false");
-  }
-
-  const model = parseReviewerModel(parsed.model);
-  if (model) config.model = model;
-  else issues.push('model must be set to "provider/model-id"');
-
-  if (parsed.allow !== undefined) {
-    if (!isRecord(parsed.allow)) {
-      issues.push("allow must be an object");
-    } else {
-      config.allowTools = readStringArray(parsed.allow.tools, "allow.tools", issues);
-
-      const bashSources = readStringArray(parsed.allow.bash, "allow.bash", issues);
-      const bashPatterns: BashAllowPattern[] = [];
-      for (const source of bashSources) {
-        try {
-          bashPatterns.push({ source, regex: new RegExp(source) });
-        } catch (error) {
-          const message = error instanceof Error ? error.message : String(error);
-          issues.push(`allow.bash contains an invalid regex (${source}): ${message}`);
-        }
-      }
-      config.allowBash = bashPatterns;
+  const allowBash: BashAllowPattern[] = [];
+  for (const source of value.allow.bash) {
+    try {
+      allowBash.push({ source, regex: new RegExp(source) });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      issues.push(`allow.bash contains an invalid regex (${source}): ${message}`);
     }
   }
 
-  config.policy = readStringArray(parsed.policy, "policy", issues);
-
-  if (parsed.timeoutMs !== undefined) {
-    if (typeof parsed.timeoutMs === "number" && Number.isInteger(parsed.timeoutMs) && parsed.timeoutMs > 0) {
-      config.timeoutMs = parsed.timeoutMs;
-    } else {
-      issues.push("timeoutMs must be a positive integer");
-    }
-  }
-
-  return { config, issues };
-}
-
-async function loadReviewConfig(path: string, readTextFile: (path: string) => Promise<string>): Promise<ReviewConfigState> {
-  const result = await loadJsonConfig(path, readTextFile);
-
-  if ("missing" in result) {
-    return { config: defaultConfig(path), issues: [`missing ${path}`] };
-  }
-  if ("problem" in result) {
-    return { config: defaultConfig(path), issues: [result.problem] };
-  }
-  return parseReviewConfigValue(result.value, path);
+  return {
+    path,
+    enabled: value.enabled,
+    model,
+    allowTools: value.allow.tool,
+    allowBash,
+    policy: value.policy,
+    timeoutMs: value.timeoutMs,
+  };
 }
 
 function matchesWholeCommand(regex: RegExp, command: string): boolean {
@@ -483,8 +427,7 @@ function buildOpenCircuit(reason: string): ToolCallEventResult {
 }
 
 export class AutoReviewController {
-  readonly configPath: string;
-  readonly readTextFile: (path: string) => Promise<string>;
+  readonly cfg: Config<typeof guardianSchema>;
   readonly now: () => number;
   readonly reviewSessionId: string;
 
@@ -496,14 +439,16 @@ export class AutoReviewController {
   readonly pendingUsage = new Map<string, Usage>();
 
   constructor(options: ControllerOptions = {}) {
-    this.configPath = options.configPath ?? getReviewConfigPath();
-    this.readTextFile = options.readTextFile ?? ((path) => readFile(path, "utf8"));
+    this.cfg = new Config("guardian", guardianSchema, options.env, options.homeDirectory);
     this.now = options.now ?? Date.now;
     this.reviewSessionId = (options.createSessionId ?? randomUUID)();
   }
 
   async reloadConfig(): Promise<ReviewConfigState> {
-    const state = await loadReviewConfig(this.configPath, this.readTextFile);
+    const { value, issues } = await this.cfg.load();
+    const mergedIssues = [...issues];
+    const config = mapConfigValue(value, this.cfg.path, mergedIssues);
+    const state = { config, issues: mergedIssues };
     this.configState = state;
     return state;
   }
@@ -562,7 +507,7 @@ export class AutoReviewController {
     if (issues.length > 0 || !config.model) {
       return {
         short: "review: fix config",
-        detail: `Auto-review needs a valid ${config.path}: ${issues[0] ?? "reviewer model is missing"}.`,
+        detail: `Auto-review needs a valid ${config.path}: ${issues[0]!}.`,
         level: "warning",
       };
     }
@@ -655,7 +600,7 @@ export class AutoReviewController {
     }
 
     if (issues.length > 0 || !config.model) {
-      return buildConfigGuidance(issues[0] ?? "reviewer model is missing", config.path);
+      return buildConfigGuidance(issues[0]!, config.path);
     }
 
     const model = ctx.modelRegistry.find(config.model.provider, config.model.modelId);

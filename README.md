@@ -37,31 +37,34 @@ pi install git:github.com/josh-sola/jpi-guardian
 
 ## Config
 
-Auto-review reads its config from `${PI_CODING_AGENT_DIR:-~/.pi/agent}/review.json`.
-It ignores project-local config on purpose. Copy `review.example.json` from
-this repo to that path and edit it:
+Auto-review reads its config from the `guardian` section of the shared
+`${PI_CODING_AGENT_DIR:-~/.pi/agent}/jpi.kdl`, the config file for the whole
+jpi plugin family. It ignores project-local config on purpose. The section is
+created with defaults the first time auto-review loads if it's missing:
 
-```json
-{
-  "model": "openai-codex/gpt-5.4-mini",
-  "enabled": true,
-  "allow": {
-    "tools": ["read", "find", "grep", "ls"],
-    "bash": ["^npm test$", "^git status --short$"]
-  },
-  "policy": [
-    "Allow routine repository inspection and focused validation commands.",
-    "Deny commands that publish code, secrets, or artifacts outside trusted destinations unless the user was explicit."
-  ],
-  "timeoutMs": 10000
+```kdl
+guardian {
+  // model that runs the reviews
+  model "anthropic/claude-sonnet-5"
+  // set to #false to disable reviews
+  enabled #true
+  // per-review timeout in milliseconds
+  timeout-ms 10000
+  allow {
+    // tool names that skip review (repeat: tool "name")
+    // regexes; a full command match skips review
+  }
+  // extra review policy lines
 }
 ```
 
-Set `model` to the reviewer model Pi should call. Keep `allow.tools` and
-`allow.bash` small: `allow.bash` entries are regular expressions that must
-match the whole command, so anchor them (for example `^npm test$`). `enabled`
-defaults to `true`. `policy` adds trusted rules on top of the bundled policy;
-it does not replace it.
+Edit the file directly, then run `/auto-review reload` in a Pi session to
+pick up the change without restarting. Set `model` to the reviewer model Pi
+should call. Keep `allow.tool` and `allow.bash` small — repeat the node for
+each entry, for example `tool "read"` or `bash "^npm test$"`. `allow.bash`
+entries are regular expressions that must match the whole command, so anchor
+them. `policy` adds trusted rules on top of the bundled policy (repeat the
+node per line); it does not replace it.
 
 ## Development
 

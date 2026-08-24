@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -7,10 +7,8 @@ import test from "node:test";
 import autoReview, {
   AutoReviewController,
   buildRecentUserTranscript,
-  getReviewConfigPath,
   isToolAllowlisted,
   mergeUsage,
-  parseReviewConfigText,
   parseReviewerDecision,
   parseReviewerModel,
   stringifyBoundedJson,
@@ -97,49 +95,117 @@ function createContext(options = {}) {
   return { ctx, notifications, statuses, calls };
 }
 
-async function withTempConfig(t, text) {
+async function withTempEnv(t) {
   const dir = await mkdtemp(join(tmpdir(), "auto-review-"));
   t.after(async () => {
     await rm(dir, { recursive: true, force: true });
   });
-
-  const configPath = join(dir, "review.json");
-  await writeFile(configPath, text);
-  return { dir, configPath };
+  return { dir, env: { PI_CODING_AGENT_DIR: dir } };
 }
 
-test("config parsing validates model syntax, defaults, and regexes", () => {
-  const parsed = parseReviewConfigText(
-    JSON.stringify({
-      model: "openai/gpt-5-mini",
-      allow: {
-        tools: ["read", "bash"],
-        bash: ["^npm test$"],
-      },
-      policy: ["Only allow package-manager commands in CI."],
-    }),
-    "/tmp/review.json",
-  );
+async function writeGuardianConfig(dir, body) {
+  await writeFile(join(dir, "jpi.kdl"), `guardian {\n${body}\n}\n`, "utf8");
+}
 
-  assert.equal(parsed.config.enabled, true);
-  assert.equal(parsed.config.timeoutMs, 10_000);
-  assert.deepEqual(parsed.config.allowTools, ["read", "bash"]);
-  assert.equal(parsed.config.allowBash[0].source, "^npm test$");
-  assert.equal(parsed.config.model?.provider, "openai");
-  assert.equal(parsed.config.model?.modelId, "gpt-5-mini");
-  assert.deepEqual(parsed.issues, []);
+test("controller loads schema defaults and creates jpi.kdl when the file is missing", async (t) => {
+  const { dir, env } = await withTempEnv(t);
+  const controller = new AutoReviewController({ env });
 
-  const invalid = parseReviewConfigText(
-    JSON.stringify({ enabled: false, model: "broken", allow: { bash: ["("] } }),
-    "/tmp/review.json",
-  );
+  const { config, issues } = await controller.ensureConfig();
 
-  assert.equal(invalid.config.enabled, false);
-  assert.match(invalid.issues[0], /model must be set/);
-  assert.match(invalid.issues[1], /invalid regex/);
+  assert.deepEqual(issues, []);
+  assert.equal(config.model?.raw, "anthropic/claude-sonnet-5");
+  assert.equal(config.enabled, true);
+  assert.equal(config.timeoutMs, 10_000);
+  assert.deepEqual(config.allowTools, []);
+  assert.deepEqual(config.allowBash, []);
+  assert.deepEqual(config.policy, []);
+
+  const text = await readFile(join(dir, "jpi.kdl"), "utf8");
+  assert.match(text, /guardian \{/);
 });
 
-test("model parsing and config path helpers behave as expected", () => {
+test("controller decodes values and allow lists from a hand-written jpi.kdl section", async (t) => {
+  const { dir, env } = await withTempEnv(t);
+  await writeGuardianConfig(
+    dir,
+    [
+      '  model "openai/reviewer"',
+      "  enabled #false",
+      "  timeout-ms 2500",
+      "  allow {",
+      '    tool "read"',
+      '    tool "grep"',
+      '    bash "^npm test$"',
+      "  }",
+      '  policy "be terse"',
+    ].join("\n"),
+  );
+
+  const controller = new AutoReviewController({ env });
+  const { config, issues } = await controller.ensureConfig();
+
+  assert.deepEqual(issues, []);
+  assert.equal(config.enabled, false);
+  assert.equal(config.timeoutMs, 2500);
+  assert.deepEqual(config.model, { raw: "openai/reviewer", provider: "openai", modelId: "reviewer" });
+  assert.deepEqual(config.allowTools, ["read", "grep"]);
+  assert.equal(config.allowBash.length, 1);
+  assert.equal(config.allowBash[0].source, "^npm test$");
+  assert.equal(isToolAllowlisted(config, { toolName: "bash", input: { command: "npm test" } }), true);
+  assert.deepEqual(config.policy, ["be terse"]);
+});
+
+test("a corrupt jpi.kdl surfaces an issue and falls back to schema defaults", async (t) => {
+  const { dir, env } = await withTempEnv(t);
+  await writeFile(join(dir, "jpi.kdl"), 'guardian {\n  model "unterminated\n}\n', "utf8");
+
+  const controller = new AutoReviewController({ env });
+  const { config, issues } = await controller.ensureConfig();
+
+  assert.equal(issues.length, 1);
+  assert.match(issues[0], /could not parse jpi\.kdl/);
+  assert.equal(config.model?.raw, "anthropic/claude-sonnet-5");
+  assert.equal(config.timeoutMs, 10_000);
+});
+
+test("an invalid allow.bash regex surfaces as an issue without failing the whole load", async (t) => {
+  const { dir, env } = await withTempEnv(t);
+  await writeGuardianConfig(dir, ['  model "openai/reviewer"', "  allow {", '    bash "("', "  }"].join("\n"));
+
+  const controller = new AutoReviewController({ env });
+  const { config, issues } = await controller.ensureConfig();
+
+  assert.equal(issues.length, 1);
+  assert.match(issues[0], /allow\.bash contains an invalid regex/);
+  assert.deepEqual(config.allowBash, []);
+  assert.equal(config.model?.raw, "openai/reviewer");
+});
+
+test("a malformed model value surfaces an issue and leaves reviewing unavailable", async (t) => {
+  const { dir, env } = await withTempEnv(t);
+  await writeGuardianConfig(dir, '  model "broken"');
+
+  const controller = new AutoReviewController({ env });
+  const { config, issues } = await controller.ensureConfig();
+
+  assert.equal(config.model, undefined);
+  assert.match(issues[0], /model must be set to "provider\/model-id"/);
+});
+
+test("reload re-reads jpi.kdl after an edit", async (t) => {
+  const { dir, env } = await withTempEnv(t);
+  const controller = new AutoReviewController({ env });
+  await controller.ensureConfig();
+
+  await writeGuardianConfig(dir, ['  model "openai/reviewer-2"', "  timeout-ms 3000"].join("\n"));
+
+  const { config } = await controller.reloadConfig();
+  assert.equal(config.model?.raw, "openai/reviewer-2");
+  assert.equal(config.timeoutMs, 3000);
+});
+
+test("model parsing behaves as expected", () => {
   assert.deepEqual(parseReviewerModel("anthropic/claude-sonnet"), {
     raw: "anthropic/claude-sonnet",
     provider: "anthropic",
@@ -147,25 +213,18 @@ test("model parsing and config path helpers behave as expected", () => {
   });
   assert.equal(parseReviewerModel("anthropic"), undefined);
   assert.equal(parseReviewerModel("/claude"), undefined);
-  assert.equal(getReviewConfigPath({ PI_CODING_AGENT_DIR: "~/custom-agent" }), join(process.env.HOME, "custom-agent", "review.json"));
 });
 
 test("allowlists are deterministic for tools and full bash commands", () => {
-  const parsed = parseReviewConfigText(
-    JSON.stringify({
-      model: "openai/gpt-5-mini",
-      allow: {
-        tools: ["read"],
-        bash: ["npm test"],
-      },
-    }),
-    "/tmp/review.json",
-  );
+  const config = {
+    allowTools: ["read"],
+    allowBash: [{ source: "npm test", regex: new RegExp("npm test") }],
+  };
 
-  assert.equal(isToolAllowlisted(parsed.config, { toolName: "read", input: { path: "README.md" } }), true);
-  assert.equal(isToolAllowlisted(parsed.config, { toolName: "write", input: { path: "README.md" } }), false);
-  assert.equal(isToolAllowlisted(parsed.config, { toolName: "bash", input: { command: "npm test" } }), true);
-  assert.equal(isToolAllowlisted(parsed.config, { toolName: "bash", input: { command: "npm test && echo done" } }), false);
+  assert.equal(isToolAllowlisted(config, { toolName: "read", input: { path: "README.md" } }), true);
+  assert.equal(isToolAllowlisted(config, { toolName: "write", input: { path: "README.md" } }), false);
+  assert.equal(isToolAllowlisted(config, { toolName: "bash", input: { command: "npm test" } }), true);
+  assert.equal(isToolAllowlisted(config, { toolName: "bash", input: { command: "npm test && echo done" } }), false);
 });
 
 test("reviewer decisions parse from strict or fenced JSON", () => {
@@ -262,13 +321,11 @@ test("usage merging preserves optional provider breakdown semantics", () => {
 });
 
 test("reviewer allow passes through and reviewer usage merges into tool results", async (t) => {
-  const { configPath } = await withTempConfig(
-    t,
-    JSON.stringify({ model: "openai/reviewer", timeoutMs: 2500 }),
-  );
+  const { dir, env } = await withTempEnv(t);
+  await writeGuardianConfig(dir, ['  model "openai/reviewer"', "  timeout-ms 2500"].join("\n"));
   let sessionIdCalls = 0;
   const controller = new AutoReviewController({
-    configPath,
+    env,
     createSessionId: () => `review-session-${sessionIdCalls += 1}`,
   });
   const reviewerUsage = makeUsage(5);
@@ -319,11 +376,9 @@ test("reviewer allow passes through and reviewer usage merges into tool results"
 });
 
 test("reviewer denials survive allowlisted calls and trigger the third-denial circuit breaker", async (t) => {
-  const { configPath } = await withTempConfig(
-    t,
-    JSON.stringify({ model: "openai/reviewer", allow: { tools: ["read"] } }),
-  );
-  const controller = new AutoReviewController({ configPath });
+  const { dir, env } = await withTempEnv(t);
+  await writeGuardianConfig(dir, ['  model "openai/reviewer"', "  allow {", '    tool "read"', "  }"].join("\n"));
+  const controller = new AutoReviewController({ env });
   const { ctx, calls } = createContext({
     complete: async () => makeAssistant('{"decision":"deny","reason":"hard delete outside the user request"}', makeUsage(3)),
   });
@@ -361,8 +416,9 @@ test("reviewer denials survive allowlisted calls and trigger the third-denial ci
 });
 
 test("reviewer failures do not reset the denial streak", async (t) => {
-  const { configPath } = await withTempConfig(t, JSON.stringify({ model: "openai/reviewer" }));
-  const controller = new AutoReviewController({ configPath });
+  const { dir, env } = await withTempEnv(t);
+  await writeGuardianConfig(dir, '  model "openai/reviewer"');
+  const controller = new AutoReviewController({ env });
   let denyNext = true;
   const { ctx } = createContext({
     complete: async () => {
@@ -396,8 +452,9 @@ test("reviewer failures do not reset the denial streak", async (t) => {
 });
 
 test("malformed reviewer output, reviewer errors, and reviewer timeouts fail closed", async (t) => {
-  const malformedConfig = await withTempConfig(t, JSON.stringify({ model: "openai/reviewer" }));
-  const malformedController = new AutoReviewController({ configPath: malformedConfig.configPath });
+  const malformedEnv = await withTempEnv(t);
+  await writeGuardianConfig(malformedEnv.dir, '  model "openai/reviewer"');
+  const malformedController = new AutoReviewController({ env: malformedEnv.env });
   const malformedCtx = createContext({
     complete: async () => makeAssistant("hello", makeUsage(1)),
   }).ctx;
@@ -417,8 +474,9 @@ test("malformed reviewer output, reviewer errors, and reviewer timeouts fail clo
   assert.equal(malformedAgain?.terminate, true);
   assert.match(malformedAgain?.reason, /Stop here and ask the user/);
 
-  const lengthConfig = await withTempConfig(t, JSON.stringify({ model: "openai/reviewer" }));
-  const lengthController = new AutoReviewController({ configPath: lengthConfig.configPath });
+  const lengthEnv = await withTempEnv(t);
+  await writeGuardianConfig(lengthEnv.dir, '  model "openai/reviewer"');
+  const lengthController = new AutoReviewController({ env: lengthEnv.env });
   const lengthCtx = createContext({
     complete: async () => makeAssistant('{"decision":"allow","reason":"partial"}', makeUsage(1), { stopReason: "length" }),
   }).ctx;
@@ -429,8 +487,9 @@ test("malformed reviewer output, reviewer errors, and reviewer timeouts fail clo
   assert.equal(lengthStopped?.block, true);
   assert.match(lengthStopped?.reason, /reviewer stopped with length/);
 
-  const errorConfig = await withTempConfig(t, JSON.stringify({ model: "openai/reviewer" }));
-  const errorController = new AutoReviewController({ configPath: errorConfig.configPath });
+  const errorEnv = await withTempEnv(t);
+  await writeGuardianConfig(errorEnv.dir, '  model "openai/reviewer"');
+  const errorController = new AutoReviewController({ env: errorEnv.env });
   const errorCtx = createContext({
     complete: async () => {
       throw new Error("upstream failed");
@@ -443,8 +502,9 @@ test("malformed reviewer output, reviewer errors, and reviewer timeouts fail clo
   assert.equal(reviewerError?.block, true);
   assert.match(reviewerError?.reason, /upstream failed/);
 
-  const timeoutConfig = await withTempConfig(t, JSON.stringify({ model: "openai/reviewer", timeoutMs: 20 }));
-  const timeoutController = new AutoReviewController({ configPath: timeoutConfig.configPath });
+  const timeoutEnv = await withTempEnv(t);
+  await writeGuardianConfig(timeoutEnv.dir, ['  model "openai/reviewer"', "  timeout-ms 20"].join("\n"));
+  const timeoutController = new AutoReviewController({ env: timeoutEnv.env });
   const timeoutCtx = createContext({
     complete: async (_model, _context, completeOptions) =>
       await new Promise((resolve, reject) => {
@@ -460,11 +520,9 @@ test("malformed reviewer output, reviewer errors, and reviewer timeouts fail clo
 });
 
 test("missing reviewer auth fails closed but allowlisted tools still pass", async (t) => {
-  const { configPath } = await withTempConfig(
-    t,
-    JSON.stringify({ model: "openai/reviewer", allow: { tools: ["read"] } }),
-  );
-  const controller = new AutoReviewController({ configPath });
+  const { dir, env } = await withTempEnv(t);
+  await writeGuardianConfig(dir, ['  model "openai/reviewer"', "  allow {", '    tool "read"', "  }"].join("\n"));
+  const controller = new AutoReviewController({ env });
   const { ctx } = createContext({
     hasConfiguredAuth: () => false,
     complete: async () => {
@@ -490,8 +548,9 @@ test("missing reviewer auth fails closed but allowlisted tools still pass", asyn
 });
 
 test("session toggles preserve pending reviewer usage", async (t) => {
-  const { configPath } = await withTempConfig(t, JSON.stringify({ model: "openai/reviewer" }));
-  const controller = new AutoReviewController({ configPath });
+  const { dir, env } = await withTempEnv(t);
+  await writeGuardianConfig(dir, '  model "openai/reviewer"');
+  const controller = new AutoReviewController({ env });
   const reviewerUsage = makeUsage(7);
   const { ctx } = createContext({
     complete: async () => makeAssistant('{"decision":"allow","reason":"routine"}', reviewerUsage),
@@ -533,8 +592,9 @@ test("extension resets breaker state at agent-run boundaries and patches final t
 });
 
 test("commands report status, reload config, and toggle session overrides without writing config", async (t) => {
-  const { configPath } = await withTempConfig(t, JSON.stringify({ model: "openai/reviewer" }));
-  const controller = new AutoReviewController({ configPath });
+  const { dir, env } = await withTempEnv(t);
+  await writeGuardianConfig(dir, '  model "openai/reviewer"');
+  const controller = new AutoReviewController({ env });
   const { ctx, notifications, statuses } = createContext({
     complete: async () => makeAssistant('{"decision":"allow","reason":"ok"}', makeUsage(1)),
   });
@@ -543,7 +603,7 @@ test("commands report status, reload config, and toggle session overrides withou
   assert.match(notifications.at(-1).message, /Auto-review is on with openai\/reviewer/);
   assert.equal(statuses.at(-1).value, "review: on");
 
-  await writeFile(configPath, JSON.stringify({ enabled: false, model: "openai/reviewer" }));
+  await writeGuardianConfig(dir, ['  model "openai/reviewer"', "  enabled #false"].join("\n"));
   await controller.handleCommand("reload", ctx);
   assert.match(notifications.at(-1).message, /off in/);
   assert.equal(statuses.at(-1).value, "review: off");

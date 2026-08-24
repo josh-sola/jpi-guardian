@@ -22,6 +22,17 @@ Calls listed in `allow.tools`, or bash commands matching a pattern in
 `allow.bash`, skip the reviewer entirely. Once a call passes review, its
 arguments are frozen so nothing downstream can change what actually runs.
 
+A bash command only skips the reviewer as a whole if every part of it does.
+Guardian parses the command and, when it has a simple shape — one command, or
+several joined by `&&`, `||`, `;`, or `|` — splits it into its individual
+commands and checks each one on its own. A command stays whole (and needs a
+full `allow.bash` match, exactly as before) whenever the split would be
+ambiguous: shell operators it doesn't parse, variable expansion, command
+substitution, redirects, globs, background jobs, subshells, loops, and
+anything else it can't fully account for. Every split part must clear the
+gate — matching an `allow.bash` pattern, or landing on the built-in read-only
+command list — or the reviewer still sees the call.
+
 Reviewer failures (timeouts, errors, bad output) count separately from
 denials and fail closed: the agent gets one retry, then the run stops.
 
@@ -53,6 +64,8 @@ guardian {
   allow {
     // tool names that skip review (repeat: tool "name")
     // regexes; a full command match skips review
+    // set to #false to disable the built-in read-only command list
+    readonly #true
   }
   // extra review policy lines
 }
@@ -62,8 +75,12 @@ Edit the file directly, then run `/auto-review reload` in a Pi session to
 pick up the change without restarting. Set `model` to the reviewer model Pi
 should call. Keep `allow.tool` and `allow.bash` small — repeat the node for
 each entry, for example `tool "read"` or `bash "^npm test$"`. `allow.bash`
-entries are regular expressions that must match the whole command, so anchor
-them. `policy` adds trusted rules on top of the bundled policy (repeat the
+entries are regular expressions that must match a whole command or a whole
+split part, so anchor them. `allow.readonly` turns off the built-in read-only
+command list (`ls`, `git status`, `cat`, and the like — see the splitting
+paragraph above) without turning off splitting itself; set it to `#false` if
+you want every part of a split command to need an explicit `allow.bash`
+match. `policy` adds trusted rules on top of the bundled policy (repeat the
 node per line); it does not replace it.
 
 ## Development

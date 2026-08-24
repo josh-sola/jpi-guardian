@@ -5,6 +5,8 @@ import type { ExtensionAPI, ToolCallEvent, ToolCallEventResult, ToolResultEvent,
 import { Config, j } from "jpi-base";
 
 import { REVIEW_POLICY } from "./policy.ts";
+import { isReadOnlyCommand } from "./readonly.ts";
+import { splitCommand } from "./split.ts";
 
 const COMMAND_NAME = "auto-review";
 const STATUS_KEY = "auto-review";
@@ -40,6 +42,9 @@ const guardianSchema = j.node({
           description: "regexes; a full command match skips review",
           default: [],
         }),
+        readonly: j.boolean()
+          .describe("set to #false to disable the built-in read-only command list")
+          .default(true),
       },
     }),
     policy: j.list(j.string(), {
@@ -68,6 +73,7 @@ type ReviewConfig = {
   model?: ReviewerModelSpec;
   allowTools: string[];
   allowBash: BashAllowPattern[];
+  readonly: boolean;
   policy: string[];
   timeoutMs: number;
 };
@@ -192,6 +198,7 @@ function mapConfigValue(value: GuardianConfigValue, path: string, issues: string
     model,
     allowTools: value.allow.tool,
     allowBash,
+    readonly: value.allow.readonly,
     policy: value.policy,
     timeoutMs: value.timeoutMs,
   };
@@ -210,7 +217,18 @@ export function isToolAllowlisted(config: ReviewConfig, event: Pick<ToolCallEven
   const command = isRecord(event.input) && typeof event.input.command === "string" ? event.input.command : undefined;
   if (!command) return false;
 
-  return config.allowBash.some((pattern) => matchesWholeCommand(pattern.regex, command));
+  const split = splitCommand(command);
+  if (split.kind === "opaque") {
+    return config.allowBash.some((pattern) => matchesWholeCommand(pattern.regex, command));
+  }
+
+  // Most-restrictive-wins: every segment needs its own justification, so one
+  // unsafe half of a split command can never ride on a safe sibling.
+  return split.segments.every(
+    (segment) =>
+      (config.readonly && isReadOnlyCommand(segment.argv)) ||
+      config.allowBash.some((pattern) => matchesWholeCommand(pattern.regex, segment.text)),
+  );
 }
 
 function toJsonValue(value: unknown, depth = 0, seen = new WeakSet<object>()): unknown {

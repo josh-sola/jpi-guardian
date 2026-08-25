@@ -1,8 +1,53 @@
 const ANY_ARGS = new Set([
-  "cal", "uptime", "cat", "head", "tail", "wc", "stat", "strings", "hexdump", "od", "nl", "id", "uname",
-  "free", "df", "du", "locale", "groups", "nproc", "basename", "dirname", "realpath", "cut", "paste", "tr",
-  "column", "tac", "rev", "fold", "expand", "unexpand", "fmt", "comm", "cmp", "numfmt", "readlink", "diff",
-  "true", "false", "sleep", "which", "type", "expr", "seq", "tsort", "pr", "echo", "ls", "cd",
+  "cal",
+  "uptime",
+  "cat",
+  "head",
+  "tail",
+  "wc",
+  "stat",
+  "strings",
+  "hexdump",
+  "od",
+  "nl",
+  "id",
+  "uname",
+  "free",
+  "df",
+  "du",
+  "locale",
+  "groups",
+  "nproc",
+  "basename",
+  "dirname",
+  "realpath",
+  "cut",
+  "paste",
+  "tr",
+  "column",
+  "tac",
+  "rev",
+  "fold",
+  "expand",
+  "unexpand",
+  "fmt",
+  "comm",
+  "cmp",
+  "numfmt",
+  "readlink",
+  "diff",
+  "true",
+  "false",
+  "sleep",
+  "which",
+  "type",
+  "expr",
+  "seq",
+  "tsort",
+  "pr",
+  "echo",
+  "ls",
+  "cd",
 ]);
 
 const ZERO_ARGS_ONLY = new Set(["pwd", "whoami", "alias"]);
@@ -16,8 +61,17 @@ const EXACT_ARGV_FORMS: readonly string[][] = [
 ];
 
 const GIT_SUBCOMMANDS_WITH_ARGS = new Set([
-  "status", "log", "diff", "show", "blame", "shortlog", "describe", "rev-parse", "ls-files",
-  "cat-file", "for-each-ref",
+  "status",
+  "log",
+  "diff",
+  "show",
+  "blame",
+  "shortlog",
+  "describe",
+  "rev-parse",
+  "ls-files",
+  "cat-file",
+  "for-each-ref",
 ]);
 
 const GH_SUBCOMMANDS: Record<string, Set<string>> = {
@@ -50,7 +104,9 @@ function isReadOnlyGit(argv: string[]): boolean {
 
   if (subcommand === "branch") {
     const rest = argv.slice(2);
-    return rest.every((arg) => arg === "--list" || arg === "-a" || arg === "-r" || arg === "-v" || arg === "-vv");
+    return rest.every(
+      (arg) => arg === "--list" || arg === "-a" || arg === "-r" || arg === "-v" || arg === "-vv",
+    );
   }
 
   if (subcommand === "tag") {

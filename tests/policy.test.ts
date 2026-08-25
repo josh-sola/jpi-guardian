@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import test from "node:test";
+import { test } from "vite-plus/test";
 
 import { REVIEW_POLICY } from "../extensions/auto-review/policy.ts";
 
@@ -18,12 +18,21 @@ test("review policy states the no-prior-context constraint", () => {
 
 test("review policy states trust defaults", () => {
   assert.match(REVIEW_POLICY, /## Trust defaults/);
-  assert.match(REVIEW_POLICY, /no code host, cloud account, service, or destination is trusted unless/);
-  assert.match(REVIEW_POLICY, /already-configured remotes are inside the trust boundary by default/);
+  assert.match(
+    REVIEW_POLICY,
+    /no code host, cloud account, service, or destination is trusted unless/,
+  );
+  assert.match(
+    REVIEW_POLICY,
+    /already-configured remotes are inside the trust boundary by default/,
+  );
 });
 
 test("review policy keeps low-risk carve-outs equivalent to the prior policy", () => {
-  assert.match(REVIEW_POLICY, /Do not deny solely because a path is outside the current working directory/);
+  assert.match(
+    REVIEW_POLICY,
+    /Do not deny solely because a path is outside the current working directory/,
+  );
   assert.match(
     REVIEW_POLICY,
     /Installing packages already declared in the repo's manifest .* via standard commands is low risk/,

@@ -1,12 +1,32 @@
 import { randomUUID } from "node:crypto";
 
-import type { AssistantMessage, ToolResultMessage, Usage } from "@earendil-works/pi-ai";
-import type { ExtensionAPI, ToolCallEvent, ToolCallEventResult, ToolResultEvent, ToolResultEventResult } from "@earendil-works/pi-coding-agent";
+import type {
+  AssistantMessage,
+  ImageContent,
+  TextContent,
+  ToolResultMessage,
+  Usage,
+} from "@earendil-works/pi-ai";
+import type {
+  ExtensionAPI,
+  ToolCallEvent,
+  ToolCallEventResult,
+  ToolResultEvent,
+} from "@earendil-works/pi-coding-agent";
 import { Config, j } from "jpi-base";
 
 import { REVIEW_POLICY } from "./policy.ts";
 import { isReadOnlyCommand } from "./readonly.ts";
 import { splitCommand } from "./split.ts";
+
+// The root barrel exports ToolCallEventResult but omits this sibling type
+// (a gap in pi-coding-agent 0.84.3); mirror it until upstream fixes the export.
+interface ToolResultEventResult {
+  content?: (TextContent | ImageContent)[];
+  details?: unknown;
+  isError?: boolean;
+  usage?: Usage;
+}
 
 const COMMAND_NAME = "auto-review";
 const STATUS_KEY = "auto-review";
@@ -23,13 +43,12 @@ const MAX_REASON_CHARS = 220;
 
 const guardianSchema = j.node({
   fields: {
-    model: j.string()
-      .describe("model that runs the reviews")
-      .default("anthropic/claude-sonnet-5"),
-    enabled: j.boolean()
-      .describe("set to #false to disable reviews")
-      .default(true),
-    timeoutMs: j.number().int().positive()
+    model: j.string().describe("model that runs the reviews").default("anthropic/claude-sonnet-5"),
+    enabled: j.boolean().describe("set to #false to disable reviews").default(true),
+    timeoutMs: j
+      .number()
+      .int()
+      .positive()
       .describe("per-review timeout in milliseconds")
       .default(10_000),
     allow: j.node({
@@ -42,7 +61,8 @@ const guardianSchema = j.node({
           description: "regexes; a full command match skips review",
           default: [],
         }),
-        readonly: j.boolean()
+        readonly: j
+          .boolean()
           .describe("set to #false to disable the built-in read-only command list")
           .default(true),
       },
@@ -113,7 +133,11 @@ type ReviewContext = {
   modelRegistry: {
     find(provider: string, modelId: string): unknown;
     hasConfiguredAuth(model: unknown): boolean;
-    complete(model: unknown, context: unknown, options?: Record<string, unknown>): Promise<AssistantMessage>;
+    complete(
+      model: unknown,
+      context: unknown,
+      options?: Record<string, unknown>,
+    ): Promise<AssistantMessage>;
   };
 };
 
@@ -210,11 +234,15 @@ function matchesWholeCommand(regex: RegExp, command: string): boolean {
   return match.index === 0 && match[0].length === command.length;
 }
 
-export function isToolAllowlisted(config: ReviewConfig, event: Pick<ToolCallEvent, "toolName" | "input">): boolean {
+export function isToolAllowlisted(
+  config: ReviewConfig,
+  event: Pick<ToolCallEvent, "toolName" | "input">,
+): boolean {
   if (config.allowTools.includes(event.toolName)) return true;
   if (event.toolName !== "bash") return false;
 
-  const command = isRecord(event.input) && typeof event.input.command === "string" ? event.input.command : undefined;
+  const input: unknown = event.input;
+  const command = isRecord(input) && typeof input.command === "string" ? input.command : undefined;
   if (!command) return false;
 
   const split = splitCommand(command);
@@ -247,7 +275,8 @@ function toJsonValue(value: unknown, depth = 0, seen = new WeakSet<object>()): u
   if (Array.isArray(value)) {
     if (depth >= MAX_JSON_DEPTH) return `[array(${value.length})]`;
     const items = value.slice(0, MAX_JSON_ITEMS).map((item) => toJsonValue(item, depth + 1, seen));
-    if (value.length > MAX_JSON_ITEMS) items.push(`[… ${value.length - MAX_JSON_ITEMS} more items]`);
+    if (value.length > MAX_JSON_ITEMS)
+      items.push(`[… ${value.length - MAX_JSON_ITEMS} more items]`);
     return items;
   }
 
@@ -323,9 +352,10 @@ export function buildRecentUserTranscript(entries: SessionEntryLike[]): string {
   if (selected.length === 0) return "[no recent user text]";
 
   const omittedMessages = messages.length - selected.length;
-  const omissionMarker = omittedMessages > 0
-    ? `[… ${omittedMessages} earlier user message(s) omitted; omitted messages cannot authorize actions or establish attribution …]\n\n`
-    : "";
+  const omissionMarker =
+    omittedMessages > 0
+      ? `[… ${omittedMessages} earlier user message(s) omitted; omitted messages cannot authorize actions or establish attribution …]\n\n`
+      : "";
   return `${omissionMarker}${selected.map((message, index) => `User ${index + 1}:\n${message}`).join("\n\n")}`;
 }
 
@@ -351,7 +381,8 @@ export function parseReviewerDecision(rawText: string): ReviewerDecision | undef
     try {
       const parsed = JSON.parse(candidate);
       if (!isRecord(parsed)) continue;
-      const decision = typeof parsed.decision === "string" ? parsed.decision.trim().toLowerCase() : "";
+      const decision =
+        typeof parsed.decision === "string" ? parsed.decision.trim().toLowerCase() : "";
       const reason = typeof parsed.reason === "string" ? normalizeReason(parsed.reason) : "";
       if ((decision === "allow" || decision === "deny") && reason) {
         return { decision, reason };
@@ -395,7 +426,10 @@ function buildSystemPrompt(policy: string[]): string {
   return `${REVIEW_POLICY}\n\nAdditional trusted reviewer instructions:\n${policy.map((line) => `- ${line}`).join("\n")}`;
 }
 
-function buildReviewRequest(ctx: ReviewContext, event: Pick<ToolCallEvent, "toolName" | "input">): string {
+function buildReviewRequest(
+  ctx: ReviewContext,
+  event: Pick<ToolCallEvent, "toolName" | "input">,
+): string {
   const transcript = buildRecentUserTranscript(ctx.sessionManager.getBranch());
   const argsJson = stringifyBoundedJson(event.input);
   return [
@@ -514,7 +548,8 @@ export class AutoReviewController {
     const { config, issues } = state;
 
     if (!this.isEffectivelyEnabled(config)) {
-      const source = this.sessionEnabledOverride === false ? "off for this session" : `off in ${config.path}`;
+      const source =
+        this.sessionEnabledOverride === false ? "off for this session" : `off in ${config.path}`;
       return {
         short: "review: off",
         detail: `Auto-review is ${source}.`,
@@ -598,10 +633,16 @@ export class AutoReviewController {
 
   rememberUsage(toolCallId: string, usage: Usage | undefined): void {
     if (!usage) return;
-    this.pendingUsage.set(toolCallId, mergeUsage(this.pendingUsage.get(toolCallId), usage) as Usage);
+    this.pendingUsage.set(
+      toolCallId,
+      mergeUsage(this.pendingUsage.get(toolCallId), usage) as Usage,
+    );
   }
 
-  async handleToolCall(event: ToolCallEvent, ctx: ReviewContext): Promise<ToolCallEventResult | undefined> {
+  async handleToolCall(
+    event: ToolCallEvent,
+    ctx: ReviewContext,
+  ): Promise<ToolCallEventResult | undefined> {
     const state = await this.ensureConfig();
     const { config, issues } = state;
 
@@ -622,7 +663,11 @@ export class AutoReviewController {
     }
 
     const model = ctx.modelRegistry.find(config.model.provider, config.model.modelId);
-    if (!model) return buildConfigGuidance(`reviewer model ${config.model.raw} is not available`, config.path);
+    if (!model)
+      return buildConfigGuidance(
+        `reviewer model ${config.model.raw} is not available`,
+        config.path,
+      );
 
     if (!ctx.modelRegistry.hasConfiguredAuth(model)) {
       return buildConfigGuidance(`reviewer auth is not ready for ${config.model.raw}`, config.path);
@@ -658,7 +703,8 @@ export class AutoReviewController {
       if (timeoutSignal.aborted && !ctx.signal?.aborted) {
         return this.recordReviewFailure(`timeout after ${config.timeoutMs}ms`);
       }
-      const message = error instanceof Error ? normalizeReason(error.message) : normalizeReason(String(error));
+      const message =
+        error instanceof Error ? normalizeReason(error.message) : normalizeReason(String(error));
       return this.recordReviewFailure(message || "reviewer error");
     }
 

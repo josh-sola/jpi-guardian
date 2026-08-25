@@ -41,6 +41,10 @@ const MAX_JSON_KEYS = 40;
 const MAX_JSON_ITEMS = 20;
 const MAX_JSON_STRING = 4_000;
 const MAX_REASON_CHARS = 220;
+// Canonical tool name from @juicesharp/rpiv-ask-user-question. Its
+// toolResult details carry both question and answer, so no pairing with
+// the originating toolCall is needed.
+const QUESTION_TOOL_NAMES = new Set(["ask_user_question"]);
 
 const guardianSchema = j.node({
   fields: {
@@ -122,6 +126,8 @@ type SessionEntryLike = {
   message?: {
     role?: string;
     content?: unknown;
+    toolName?: string;
+    details?: unknown;
   };
 };
 
@@ -367,32 +373,94 @@ function extractUserText(content: unknown): string {
     .trim();
 }
 
-export function buildRecentUserTranscript(entries: SessionEntryLike[]): string {
-  const messages = entries
-    .filter((entry) => entry.type === "message" && entry.message?.role === "user")
-    .map((entry) => truncateUserMessage(extractUserText(entry.message?.content)))
-    .filter(Boolean);
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0;
+}
 
-  const selected: string[] = [];
+// details is a QuestionnaireResult from @juicesharp/rpiv-ask-user-question,
+// a package this plugin does not depend on.
+export function renderQuestionAnswers(details: unknown): string {
+  if (!isRecord(details)) return "";
+  if (isNonEmptyString(details.error)) return "";
+
+  if (details.cancelled === true) {
+    const decline = "[User declined to answer the question(s)]";
+    return isNonEmptyString(details.globalNote) ? `${decline}\nNote: ${details.globalNote}` : decline;
+  }
+
+  if (!Array.isArray(details.answers)) return "";
+
+  const blocks: string[] = [];
+  for (const item of details.answers) {
+    if (!isRecord(item) || !isNonEmptyString(item.question)) continue;
+
+    const answerText =
+      item.kind === "multi"
+        ? Array.isArray(item.selected)
+          ? item.selected.filter((value): value is string => typeof value === "string").join(", ")
+          : undefined
+        : typeof item.answer === "string"
+          ? item.answer
+          : undefined;
+    if (answerText === undefined) continue;
+
+    let block = `Q: ${item.question}\nA: ${answerText}`;
+    if (isNonEmptyString(item.notes)) block += `\nNote: ${item.notes}`;
+    blocks.push(block);
+  }
+
+  return blocks.join("\n\n");
+}
+
+type TranscriptItem = {
+  text: string;
+  answered: boolean;
+};
+
+export function buildRecentUserTranscript(entries: SessionEntryLike[]): string {
+  const items: TranscriptItem[] = [];
+  for (const entry of entries) {
+    if (entry.type !== "message" || !entry.message) continue;
+    const { role } = entry.message;
+
+    if (role === "user") {
+      const text = truncateUserMessage(extractUserText(entry.message.content));
+      if (text) items.push({ text, answered: false });
+    } else if (
+      role === "toolResult" &&
+      typeof entry.message.toolName === "string" &&
+      QUESTION_TOOL_NAMES.has(entry.message.toolName)
+    ) {
+      const text = truncateUserMessage(renderQuestionAnswers(entry.message.details));
+      if (text) items.push({ text, answered: true });
+    }
+  }
+
+  const selected: TranscriptItem[] = [];
   let total = 0;
 
-  for (let index = messages.length - 1; index >= 0; index -= 1) {
-    const message = messages[index];
-    const nextTotal = total + message.length;
+  for (let index = items.length - 1; index >= 0; index -= 1) {
+    const item = items[index];
+    const nextTotal = total + item.text.length;
     if (selected.length > 0 && nextTotal > MAX_TRANSCRIPT_CHARS) break;
     if (selected.length >= MAX_USER_MESSAGES) break;
-    selected.unshift(message);
+    selected.unshift(item);
     total = nextTotal;
   }
 
   if (selected.length === 0) return "[no recent user text]";
 
-  const omittedMessages = messages.length - selected.length;
+  const omittedMessages = items.length - selected.length;
   const omissionMarker =
     omittedMessages > 0
       ? `[… ${omittedMessages} earlier user message(s) omitted; omitted messages cannot authorize actions or establish attribution …]\n\n`
       : "";
-  return `${omissionMarker}${selected.map((message, index) => `User ${index + 1}:\n${message}`).join("\n\n")}`;
+  return `${omissionMarker}${selected
+    .map(
+      (item, index) =>
+        `User ${index + 1}${item.answered ? " (answered agent's question)" : ""}:\n${item.text}`,
+    )
+    .join("\n\n")}`;
 }
 
 function getReviewerText(response: AssistantMessage): string {

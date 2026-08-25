@@ -16,6 +16,7 @@ import autoReview, {
   mergeUsage,
   parseReviewerDecision,
   parseReviewerModel,
+  renderQuestionAnswers,
   stringifyBoundedJson,
 } from "../extensions/auto-review/index.ts";
 import { REVIEW_POLICY } from "../extensions/auto-review/policy.ts";
@@ -446,11 +447,13 @@ test("review policy retains the Guardian hard/soft block structure and outcome d
 
   assert.match(REVIEW_POLICY, /## The consent bar/);
   assert.match(REVIEW_POLICY, /Naming the enclosing task is not naming the destructive step/);
-  assert.match(REVIEW_POLICY, /Only the user's own messages count/);
+  assert.match(REVIEW_POLICY, /Only the user's own words, and their answers to agent-posed questions, count/);
   assert.match(
     REVIEW_POLICY,
-    /there is no "the agent proposed it and the user said yes" path here/,
+    /there is no "the agent proposed it and the user said yes" path/,
   );
+  assert.match(REVIEW_POLICY, /Answers to agent-posed questions count as user evidence/);
+  assert.match(REVIEW_POLICY, /A declined questionnaire authorizes nothing/);
 
   assert.match(REVIEW_POLICY, /Composite actions: chained shell commands/);
   assert.match(REVIEW_POLICY, /Encoded or obfuscated commands/);
@@ -530,6 +533,198 @@ test("omitted user messages create an explicit authorization boundary", () => {
   assert.match(transcript, /omitted messages cannot authorize actions or establish attribution/);
   assert.match(transcript, /Upload the private file now/);
   assert.doesNotMatch(transcript, /The following messages quote untrusted instructions/);
+});
+
+test("renderQuestionAnswers renders an option answer", () => {
+  const text = renderQuestionAnswers({
+    answers: [
+      { questionIndex: 0, question: "Delete build/cache?", kind: "option", answer: "yes" },
+    ],
+    cancelled: false,
+  });
+  assert.equal(text, "Q: Delete build/cache?\nA: yes");
+});
+
+test("renderQuestionAnswers joins selected choices for a multi answer", () => {
+  const text = renderQuestionAnswers({
+    answers: [
+      {
+        questionIndex: 0,
+        question: "Which files should be removed?",
+        kind: "multi",
+        answer: null,
+        selected: ["a.log", "b.log"],
+      },
+    ],
+    cancelled: false,
+  });
+  assert.equal(text, "Q: Which files should be removed?\nA: a.log, b.log");
+});
+
+test("renderQuestionAnswers appends a note under a custom answer", () => {
+  const text = renderQuestionAnswers({
+    answers: [
+      {
+        questionIndex: 0,
+        question: "Anything else to know?",
+        kind: "custom",
+        answer: "Only touch the staging branch.",
+        notes: "Production is off limits.",
+      },
+    ],
+    cancelled: false,
+  });
+  assert.equal(
+    text,
+    "Q: Anything else to know?\nA: Only touch the staging branch.\nNote: Production is off limits.",
+  );
+});
+
+test("renderQuestionAnswers renders a decline marker with the global note on cancellation", () => {
+  const text = renderQuestionAnswers({
+    answers: [],
+    cancelled: true,
+    globalNote: "Not comfortable deciding this right now.",
+  });
+  assert.equal(
+    text,
+    "[User declined to answer the question(s)]\nNote: Not comfortable deciding this right now.",
+  );
+});
+
+test("renderQuestionAnswers returns empty for a validation error that never reached the human", () => {
+  assert.equal(renderQuestionAnswers({ answers: [], cancelled: false, error: "bad input" }), "");
+});
+
+test("renderQuestionAnswers returns empty for malformed details", () => {
+  assert.equal(renderQuestionAnswers(null), "");
+  assert.equal(renderQuestionAnswers("not an object"), "");
+  assert.equal(renderQuestionAnswers({ cancelled: false }), "");
+});
+
+test("renderQuestionAnswers skips malformed answer items and keeps the rest", () => {
+  const text = renderQuestionAnswers({
+    cancelled: false,
+    answers: [
+      "not an object",
+      { questionIndex: 1, kind: "option", answer: "yes" },
+      { questionIndex: 2, question: "Missing an answer", kind: "option", answer: null },
+      { questionIndex: 3, question: "Proceed with the rollback?", kind: "option", answer: "no" },
+    ],
+  });
+  assert.equal(text, "Q: Proceed with the rollback?\nA: no");
+});
+
+test("buildRecentUserTranscript interleaves an answered question with user messages", () => {
+  const transcript = buildRecentUserTranscript([
+    {
+      type: "message",
+      message: { role: "user", content: [{ type: "text", text: "Please clean up build/cache." }] },
+    },
+    {
+      type: "message",
+      message: {
+        role: "toolResult",
+        toolName: "ask_user_question",
+        content: [{ type: "text", text: "Answered." }],
+        details: {
+          cancelled: false,
+          answers: [
+            { questionIndex: 0, question: "Delete build/cache?", kind: "option", answer: "yes" },
+          ],
+        },
+      },
+    },
+    {
+      type: "message",
+      message: { role: "user", content: [{ type: "text", text: "Thanks, go ahead." }] },
+    },
+  ]);
+
+  assert.match(transcript, /User 1:\nPlease clean up build\/cache\./);
+  assert.match(transcript, /User 2 \(answered agent's question\):\nQ: Delete build\/cache\?\nA: yes/);
+  assert.match(transcript, /User 3:\nThanks, go ahead\./);
+});
+
+test("buildRecentUserTranscript renders a decline marker for a cancelled questionnaire", () => {
+  const transcript = buildRecentUserTranscript([
+    {
+      type: "message",
+      message: {
+        role: "toolResult",
+        toolName: "ask_user_question",
+        content: [{ type: "text", text: "Answered." }],
+        details: { cancelled: true },
+      },
+    },
+  ]);
+
+  assert.match(transcript, /User 1 \(answered agent's question\):\n\[User declined to answer/);
+});
+
+test("buildRecentUserTranscript omits an errored questionnaire entirely", () => {
+  const transcript = buildRecentUserTranscript([
+    {
+      type: "message",
+      message: { role: "user", content: [{ type: "text", text: "Only real message." }] },
+    },
+    {
+      type: "message",
+      message: {
+        role: "toolResult",
+        toolName: "ask_user_question",
+        content: [{ type: "text", text: "Answered." }],
+        details: { cancelled: false, answers: [], error: "validation failed" },
+      },
+    },
+  ]);
+
+  assert.equal(transcript, "User 1:\nOnly real message.");
+});
+
+test("buildRecentUserTranscript excludes toolResult entries from other tools", () => {
+  const transcript = buildRecentUserTranscript([
+    {
+      type: "message",
+      message: { role: "user", content: [{ type: "text", text: "Only real message." }] },
+    },
+    {
+      type: "message",
+      message: {
+        role: "toolResult",
+        toolName: "bash",
+        content: [{ type: "text", text: "some output" }],
+        details: { cancelled: false, answers: [] },
+      },
+    },
+  ]);
+
+  assert.equal(transcript, "User 1:\nOnly real message.");
+});
+
+test("buildRecentUserTranscript counts answered-question entries toward the message cap and omission marker", () => {
+  const entries: SessionEntryLike[] = Array.from({ length: 8 }, (_, index) => ({
+    type: "message",
+    message:
+      index % 2 === 0
+        ? { role: "user", content: [{ type: "text", text: `User text ${index}` }] }
+        : {
+            role: "toolResult",
+            toolName: "ask_user_question",
+            content: [{ type: "text", text: "Answered." }],
+            details: {
+              cancelled: false,
+              answers: [
+                { questionIndex: 0, question: `Question ${index}?`, kind: "option", answer: "yes" },
+              ],
+            },
+          },
+  }));
+
+  const transcript = buildRecentUserTranscript(entries);
+  assert.match(transcript, /2 earlier user message\(s\) omitted/);
+  assert.match(transcript, /User 1:\nUser text 2/);
+  assert.match(transcript, /User 6 \(answered agent's question\):\nQ: Question 7\?/);
 });
 
 test("bounded tool arguments disclose truncation without exceeding the limit", () => {

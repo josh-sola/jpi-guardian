@@ -12,8 +12,20 @@ test("review policy states the no-prior-context constraint", () => {
   assert.match(REVIEW_POLICY, /## What you see and don't/);
   assert.match(
     REVIEW_POLICY,
-    /You do not see prior agent actions, tool results, or the agent's own proposals or reasoning/,
+    /you do not see prior agent actions, tool results, or the agent's own proposals or reasoning/,
   );
+});
+
+test("review policy discloses answered agent questions as shown evidence", () => {
+  assert.match(
+    REVIEW_POLICY,
+    /Answers the human gave to questions the agent posed through a question tool are also shown, marked as such/,
+  );
+  assert.match(
+    REVIEW_POLICY,
+    /An answer authorizes only the literal thing the question asked/,
+  );
+  assert.match(REVIEW_POLICY, /A declined questionnaire authorizes nothing/);
 });
 
 test("review policy states trust defaults", () => {

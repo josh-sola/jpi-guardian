@@ -1,6 +1,6 @@
 {
   "name": "jpi-guardian",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "keywords": [
     "pi-package"
   ],
@@ -9,7 +9,7 @@
     "test": "vp test"
   },
   "dependencies": {
-    "jpi-base": "github:josh-sola/jpi-base#semver:^0.2.0",
+    "jpi-base": "github:josh-sola/jpi-base#semver:^0.6.0",
     "tree-sitter": "^0.25.1",
     "tree-sitter-bash": "^0.25.1"
   },

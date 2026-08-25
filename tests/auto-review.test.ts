@@ -10,7 +10,9 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import autoReview, {
   AutoReviewController,
   buildRecentUserTranscript,
+  isScratchpadWrite,
   isToolAllowlisted,
+  isWithinRoot,
   mergeUsage,
   parseReviewerDecision,
   parseReviewerModel,
@@ -171,6 +173,7 @@ test("controller loads schema defaults and creates jpi.kdl when the file is miss
   assert.equal(config.timeoutMs, 10_000);
   assert.deepEqual(config.allowTools, []);
   assert.deepEqual(config.allowBash, []);
+  assert.equal(config.scratchpad, true);
   assert.deepEqual(config.policy, []);
 
   const text = await readFile(join(dir, "jpi.kdl"), "utf8");
@@ -297,6 +300,110 @@ test("allowlists are deterministic for tools, full bash commands, and split segm
   assert.equal(
     isToolAllowlisted(config, { toolName: "bash", input: { command: "npm test && echo done" } }),
     true,
+  );
+});
+
+test("isWithinRoot uses real path containment, not a string prefix match", () => {
+  const root = "/scratch/root";
+
+  assert.equal(isWithinRoot(root, "/scratch/root/proj-a/session-1/notes.txt"), true);
+  // Shares the root as a string prefix but is a distinct sibling directory.
+  assert.equal(isWithinRoot(root, "/scratch/root-other/notes.txt"), false);
+  // The root itself is not "inside" the root.
+  assert.equal(isWithinRoot(root, root), false);
+  // A path that walks back out via ".." before landing outside.
+  assert.equal(isWithinRoot(root, "/scratch/root/../escape.txt"), false);
+});
+
+test("isScratchpadWrite exempts write/edit targets inside the scratchpad root", () => {
+  const root = "/scratch/root";
+  const rootFn = () => root;
+  const on = { scratchpad: true };
+  const off = { scratchpad: false };
+
+  // Absolute target already under the root, cwd elsewhere.
+  assert.equal(
+    isScratchpadWrite(
+      on,
+      { toolName: "write", input: { path: "/scratch/root/proj-a/session-1/notes.txt" } },
+      "/repo/project",
+      rootFn,
+    ),
+    true,
+  );
+  assert.equal(
+    isScratchpadWrite(
+      on,
+      { toolName: "edit", input: { path: "/scratch/root/proj-a/session-1/notes.txt", edits: [] } },
+      "/repo/project",
+      rootFn,
+    ),
+    true,
+  );
+
+  // A normal relative write inside the project, outside the scratchpad root.
+  assert.equal(
+    isScratchpadWrite(
+      on,
+      { toolName: "write", input: { path: "notes.txt" } },
+      "/repo/project",
+      rootFn,
+    ),
+    false,
+  );
+
+  // "<root>/../escape": walks back out of the root before landing.
+  assert.equal(
+    isScratchpadWrite(
+      on,
+      { toolName: "write", input: { path: "/scratch/root/../escape.txt" } },
+      "/repo/project",
+      rootFn,
+    ),
+    false,
+  );
+
+  // A relative path that resolves outside the root even though cwd sits
+  // inside it.
+  assert.equal(
+    isScratchpadWrite(
+      on,
+      { toolName: "write", input: { path: "../../../../outside.txt" } },
+      "/scratch/root/proj-a/session-1",
+      rootFn,
+    ),
+    false,
+  );
+
+  // The toggle overrides an otherwise-in-root target.
+  assert.equal(
+    isScratchpadWrite(
+      off,
+      { toolName: "write", input: { path: "/scratch/root/proj-a/session-1/notes.txt" } },
+      "/repo/project",
+      rootFn,
+    ),
+    false,
+  );
+
+  // Non-path tools, including bash, are never exempted by this check.
+  assert.equal(
+    isScratchpadWrite(
+      on,
+      { toolName: "bash", input: { command: "cat /scratch/root/proj-a/session-1/notes.txt" } },
+      "/repo/project",
+      rootFn,
+    ),
+    false,
+  );
+  assert.equal(
+    isScratchpadWrite(
+      on,
+      { toolName: "read", input: { path: "/scratch/root/notes.txt" } },
+      "/repo/project",
+      rootFn,
+    ),
+    false,
   );
 });
 
@@ -506,6 +613,82 @@ test("reviewer allow passes through and reviewer usage merges into tool results"
   assert.equal(sessionIdCalls, 1);
   assert.equal(calls[0].options.sessionId, "review-session-1");
   assert.equal(calls[1].options.sessionId, "review-session-1");
+});
+
+test("scratchpad-root writes and edits skip review while other calls stay reviewed", async (t) => {
+  const { dir, env } = await withTempEnv(t);
+  await writeGuardianConfig(dir, '  model "openai/reviewer"');
+  const scratchpadRootPath = "/scratch/root";
+  const controller = new AutoReviewController({ env, scratchpadRoot: () => scratchpadRootPath });
+  const { ctx, calls } = createContext({
+    complete: async () => makeAssistant('{"decision":"allow","reason":"routine"}', makeUsage(1)),
+  });
+
+  const insideWrite = { path: "/scratch/root/proj/session/notes.txt", content: "x" };
+  const insideWriteResult = await controller.handleToolCall(
+    { type: "tool_call", toolCallId: "in-write", toolName: "write", input: insideWrite },
+    ctx,
+  );
+  assert.equal(insideWriteResult, undefined);
+  assert.equal(calls.length, 0);
+  assert.equal(Object.isFrozen(insideWrite), true);
+
+  const insideEdit = { path: "/scratch/root/proj/session/notes.txt", edits: [] };
+  const insideEditResult = await controller.handleToolCall(
+    { type: "tool_call", toolCallId: "in-edit", toolName: "edit", input: insideEdit },
+    ctx,
+  );
+  assert.equal(insideEditResult, undefined);
+  assert.equal(calls.length, 0);
+
+  const outsideWrite = { path: "notes.txt", content: "x" };
+  await controller.handleToolCall(
+    { type: "tool_call", toolCallId: "out-write", toolName: "write", input: outsideWrite },
+    ctx,
+  );
+  assert.equal(calls.length, 1);
+
+  // "<root>/../escape": looks like it is under the root but walks back out.
+  const escapeWrite = { path: "/scratch/root/../escape.txt", content: "x" };
+  await controller.handleToolCall(
+    { type: "tool_call", toolCallId: "escape-write", toolName: "write", input: escapeWrite },
+    ctx,
+  );
+  assert.equal(calls.length, 2);
+
+  // Bash always stays reviewed, even when it names a scratchpad path (and
+  // even though "cat" alone would be built-in read-only, "rm" is not).
+  await controller.handleToolCall(
+    {
+      type: "tool_call",
+      toolCallId: "bash-inside",
+      toolName: "bash",
+      input: { command: "rm /scratch/root/proj/notes.txt" },
+    },
+    ctx,
+  );
+  assert.equal(calls.length, 3);
+});
+
+test("allow.scratchpad #false reviews scratchpad writes too", async (t) => {
+  const { dir, env } = await withTempEnv(t);
+  await writeGuardianConfig(
+    dir,
+    ['  model "openai/reviewer"', "  allow {", "    scratchpad #false", "  }"].join("\n"),
+  );
+  const scratchpadRootPath = "/scratch/root";
+  const controller = new AutoReviewController({ env, scratchpadRoot: () => scratchpadRootPath });
+  const { ctx, calls } = createContext({
+    complete: async () => makeAssistant('{"decision":"allow","reason":"routine"}', makeUsage(1)),
+  });
+
+  const insideWrite = { path: "/scratch/root/proj/session/notes.txt", content: "x" };
+  const result = await controller.handleToolCall(
+    { type: "tool_call", toolCallId: "toggled-off", toolName: "write", input: insideWrite },
+    ctx,
+  );
+  assert.equal(result, undefined);
+  assert.equal(calls.length, 1);
 });
 
 test("reviewer denials survive allowlisted calls and trigger the third-denial circuit breaker", async (t) => {

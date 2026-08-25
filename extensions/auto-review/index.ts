@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { isAbsolute, relative, resolve } from "node:path";
 
 import type {
   AssistantMessage,
@@ -13,7 +14,7 @@ import type {
   ToolCallEventResult,
   ToolResultEvent,
 } from "@earendil-works/pi-coding-agent";
-import { Config, j } from "jpi-base";
+import { Config, j, scratchpadRoot } from "jpi-base";
 
 import { REVIEW_POLICY } from "./policy.ts";
 import { isReadOnlyCommand } from "./readonly.ts";
@@ -65,6 +66,10 @@ const guardianSchema = j.node({
           .boolean()
           .describe("set to #false to disable the built-in read-only command list")
           .default(true),
+        scratchpad: j
+          .boolean()
+          .describe("set to #false to review scratchpad writes too")
+          .default(true),
       },
     }),
     policy: j.list(j.string(), {
@@ -94,6 +99,7 @@ type ReviewConfig = {
   allowTools: string[];
   allowBash: BashAllowPattern[];
   readonly: boolean;
+  scratchpad: boolean;
   policy: string[];
   timeoutMs: number;
 };
@@ -153,6 +159,7 @@ type ControllerOptions = {
   homeDirectory?: string;
   now?: () => number;
   createSessionId?: () => string;
+  scratchpadRoot?: () => string;
 };
 
 type ReviewerDecision = {
@@ -223,6 +230,7 @@ function mapConfigValue(value: GuardianConfigValue, path: string, issues: string
     allowTools: value.allow.tool,
     allowBash,
     readonly: value.allow.readonly,
+    scratchpad: value.allow.scratchpad,
     policy: value.policy,
     timeoutMs: value.timeoutMs,
   };
@@ -257,6 +265,34 @@ export function isToolAllowlisted(
       (config.readonly && isReadOnlyCommand(segment.argv)) ||
       config.allowBash.some((pattern) => matchesWholeCommand(pattern.regex, segment.text)),
   );
+}
+
+// write/edit tool inputs both carry `path`, resolved against the handler's
+// cwd by pi's own tool implementation, so it is resolved the same way here.
+function getPathToolTarget(event: Pick<ToolCallEvent, "toolName" | "input">): string | undefined {
+  if (event.toolName !== "write" && event.toolName !== "edit") return undefined;
+  const input: unknown = event.input;
+  return isRecord(input) && typeof input.path === "string" ? input.path : undefined;
+}
+
+// Containment must use path.relative, not startsWith: a sibling directory that
+// merely shares the root as a string prefix (e.g. "/tmp/jpi-scratchpad-501x")
+// must not pass, and a resolved "root/../escape" must land outside cleanly.
+export function isWithinRoot(root: string, resolvedTarget: string): boolean {
+  const rel = relative(root, resolvedTarget);
+  return rel !== "" && !rel.startsWith("..") && !isAbsolute(rel);
+}
+
+export function isScratchpadWrite(
+  config: Pick<ReviewConfig, "scratchpad">,
+  event: Pick<ToolCallEvent, "toolName" | "input">,
+  cwd: string,
+  scratchpadRootFn: () => string,
+): boolean {
+  if (!config.scratchpad) return false;
+  const target = getPathToolTarget(event);
+  if (!target) return false;
+  return isWithinRoot(scratchpadRootFn(), resolve(cwd, target));
 }
 
 function toJsonValue(value: unknown, depth = 0, seen = new WeakSet<object>()): unknown {
@@ -482,6 +518,7 @@ export class AutoReviewController {
   readonly cfg: Config<typeof guardianSchema>;
   readonly now: () => number;
   readonly reviewSessionId: string;
+  readonly scratchpadRootFn: () => string;
 
   configState: ReviewConfigState | undefined;
   sessionEnabledOverride: boolean | undefined;
@@ -494,6 +531,7 @@ export class AutoReviewController {
     this.cfg = new Config("guardian", guardianSchema, options.env, options.homeDirectory);
     this.now = options.now ?? Date.now;
     this.reviewSessionId = (options.createSessionId ?? randomUUID)();
+    this.scratchpadRootFn = options.scratchpadRoot ?? scratchpadRoot;
   }
 
   async reloadConfig(): Promise<ReviewConfigState> {
@@ -654,6 +692,11 @@ export class AutoReviewController {
     if (this.openCircuitReason) return buildOpenCircuit(this.openCircuitReason);
 
     if (isToolAllowlisted(config, event)) {
+      freezeToolInput(event.input);
+      return undefined;
+    }
+
+    if (isScratchpadWrite(config, event, ctx.cwd, this.scratchpadRootFn)) {
       freezeToolInput(event.input);
       return undefined;
     }

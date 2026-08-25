@@ -19,8 +19,10 @@ context as something that can never grant authorization on its own. You can
 add trusted, environment-specific rules on top of it without replacing it.
 
 Calls listed in `allow.tools`, or bash commands matching a pattern in
-`allow.bash`, skip the reviewer entirely. Once a call passes review, its
-arguments are frozen so nothing downstream can change what actually runs.
+`allow.bash`, skip the reviewer entirely. `write` and `edit` calls also skip
+review when their target path resolves inside the shared scratchpad root from
+`jpi-scratchpad` — see `allow.scratchpad` below. Once a call passes review,
+its arguments are frozen so nothing downstream can change what actually runs.
 
 A bash command only skips the reviewer as a whole if every part of it does.
 Guardian parses the command and, when it has a simple shape — one command, or
@@ -66,6 +68,8 @@ guardian {
     // regexes; a full command match skips review
     // set to #false to disable the built-in read-only command list
     readonly #true
+    // set to #false to review scratchpad writes too
+    scratchpad #true
   }
   // extra review policy lines
 }
@@ -82,6 +86,15 @@ paragraph above) without turning off splitting itself; set it to `#false` if
 you want every part of a split command to need an explicit `allow.bash`
 match. `policy` adds trusted rules on top of the bundled policy (repeat the
 node per line); it does not replace it.
+
+`allow.scratchpad` exempts `write` and `edit` calls whose target path
+resolves inside the per-session scratchpad directory that `jpi-scratchpad`
+steers the model to use (`jpi-base`'s `scratchpadRoot()`, under the OS temp
+directory). The check resolves the path and requires it to land inside that
+root — a lookalike sibling directory or a `..`-escape still gets reviewed.
+Bash always stays reviewed, even when a command names a scratchpad path, since
+guardian does not parse paths out of shell commands. Set `allow.scratchpad` to
+`#false` if you want scratchpad writes reviewed like everything else.
 
 ## Development
 

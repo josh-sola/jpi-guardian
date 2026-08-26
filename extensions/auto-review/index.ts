@@ -30,7 +30,7 @@ interface ToolResultEventResult {
 }
 
 const COMMAND_NAME = "auto-review";
-const STATUS_KEY = "auto-review";
+const STATUS_KEY = "@jpi-guardian/review-mode";
 const MAX_REVIEW_TOKENS = 220;
 const MAX_TOOL_ARGS_CHARS = 4_000;
 const MAX_TRANSCRIPT_CHARS = 4_000;
@@ -114,6 +114,22 @@ type ReviewConfigState = {
 };
 
 type StatusLevel = "info" | "warning";
+
+// jpi-status passes setStatus values through to the terminal unmodified, so
+// the short status carries its own truecolor SGR sequence.
+function coloredStatus(hex: string, text: string): string {
+  const value = Number.parseInt(hex.slice(1), 16);
+  const r = (value >> 16) & 0xff;
+  const g = (value >> 8) & 0xff;
+  const b = value & 0xff;
+  return `\x1b[38;2;${r};${g};${b}m${text}\x1b[0m`;
+}
+
+const STATUS_OFF = coloredStatus("#949494", "⏸ manual mode on");
+const STATUS_CONFIG_ERROR = coloredStatus("#cf8c88", "✕ auto config error");
+const STATUS_UNKNOWN_MODEL = coloredStatus("#cf8c88", "✕ unknown model");
+const STATUS_NO_AUTH = coloredStatus("#cf8c88", "✕ no review auth");
+const STATUS_ON = coloredStatus("#f8c633", "⏵⏵ auto mode on");
 
 type StatusSnapshot = {
   short: string;
@@ -657,7 +673,7 @@ export class AutoReviewController {
       const source =
         this.sessionEnabledOverride === false ? "off for this session" : `off in ${config.path}`;
       return {
-        short: "review: off",
+        short: STATUS_OFF,
         detail: `Auto-review is ${source}.`,
         level: "info",
       };
@@ -665,7 +681,7 @@ export class AutoReviewController {
 
     if (issues.length > 0 || !config.model) {
       return {
-        short: "review: fix config",
+        short: STATUS_CONFIG_ERROR,
         detail: `Auto-review needs a valid ${config.path}: ${issues[0]!}.`,
         level: "warning",
       };
@@ -674,7 +690,7 @@ export class AutoReviewController {
     const model = ctx.modelRegistry.find(config.model.provider, config.model.modelId);
     if (!model) {
       return {
-        short: "review: fix model",
+        short: STATUS_UNKNOWN_MODEL,
         detail: `Auto-review reviewer model ${config.model.raw} is not available. Update ${config.path} and run /${COMMAND_NAME} reload, or use /${COMMAND_NAME} off.`,
         level: "warning",
       };
@@ -682,14 +698,14 @@ export class AutoReviewController {
 
     if (!ctx.modelRegistry.hasConfiguredAuth(model)) {
       return {
-        short: "review: auth",
+        short: STATUS_NO_AUTH,
         detail: `Auto-review reviewer auth is not ready for ${config.model.raw}. Fix auth or ${config.path}, then run /${COMMAND_NAME} reload, or use /${COMMAND_NAME} off.`,
         level: "warning",
       };
     }
 
     return {
-      short: "review: on",
+      short: STATUS_ON,
       detail: `Auto-review is on with ${config.model.raw}.`,
       level: "info",
     };

@@ -1176,12 +1176,12 @@ test("commands report status, reload config, and toggle session overrides withou
 
   await controller.handleCommand("status", ctx);
   assert.match(notifications.at(-1)!.message, /Auto-review is on with openai\/reviewer/);
-  assert.equal(statuses.at(-1)!.value, "review: on");
+  assert.equal(statuses.at(-1)!.value, "\x1b[38;2;248;198;51m⏵⏵ auto mode on\x1b[0m");
 
   await writeGuardianConfig(dir, ['  model "openai/reviewer"', "  enabled #false"].join("\n"));
   await controller.handleCommand("reload", ctx);
   assert.match(notifications.at(-1)!.message, /off in/);
-  assert.equal(statuses.at(-1)!.value, "review: off");
+  assert.equal(statuses.at(-1)!.value, "\x1b[38;2;148;148;148m⏸ manual mode on\x1b[0m");
 
   await controller.handleCommand("on", ctx);
   assert.match(notifications.at(-1)!.message, /Auto-review is on with openai\/reviewer/);

@@ -66,6 +66,10 @@ const guardianSchema = j.node({
           description: "regexes; a full command match skips review",
           default: [],
         }),
+        mcp: j.list(j.string(), {
+          description: 'MCP servers whose tools skip review (repeat: mcp "server")',
+          default: [],
+        }),
         readonly: j
           .boolean()
           .describe("set to #false to disable the built-in read-only command list")
@@ -102,6 +106,7 @@ type ReviewConfig = {
   model?: ReviewerModelSpec;
   allowTools: string[];
   allowBash: BashAllowPattern[];
+  allowMcp: string[];
   readonly: boolean;
   scratchpad: boolean;
   policy: string[];
@@ -251,6 +256,7 @@ function mapConfigValue(value: GuardianConfigValue, path: string, issues: string
     model,
     allowTools: value.allow.tool,
     allowBash,
+    allowMcp: value.allow.mcp,
     readonly: value.allow.readonly,
     scratchpad: value.allow.scratchpad,
     policy: value.policy,
@@ -264,11 +270,22 @@ function matchesWholeCommand(regex: RegExp, command: string): boolean {
   return match.index === 0 && match[0].length === command.length;
 }
 
+// pi-mcp-adapter names server tools in one of three shapes: a namespace-proxy
+// tool ("mcp__" + server, dashes to underscores), or a directly registered
+// per-tool name ("server_tool" or "mcp__server_tool").
+export function matchesMcpServer(toolName: string, server: string): boolean {
+  if (toolName === `mcp__${server.replaceAll("-", "_")}`) return true;
+  if (toolName.startsWith(`${server}_`)) return true;
+  if (toolName.startsWith(`mcp__${server}_`)) return true;
+  return false;
+}
+
 export function isToolAllowlisted(
   config: ReviewConfig,
   event: Pick<ToolCallEvent, "toolName" | "input">,
 ): boolean {
   if (config.allowTools.includes(event.toolName)) return true;
+  if (config.allowMcp.some((server) => matchesMcpServer(event.toolName, server))) return true;
   if (event.toolName !== "bash") return false;
 
   const input: unknown = event.input;

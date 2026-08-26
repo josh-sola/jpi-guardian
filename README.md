@@ -21,11 +21,12 @@ rules for resolving low-risk exceptions and treating omitted or truncated
 context as something that can never grant authorization on its own. You can
 add trusted, environment-specific rules on top of it without replacing it.
 
-Calls listed in `allow.tools`, or bash commands matching a pattern in
-`allow.bash`, skip the reviewer entirely. `write` and `edit` calls also skip
-review when their target path resolves inside the shared scratchpad root from
-`jpi-scratchpad` — see `allow.scratchpad` below. Once a call passes review,
-its arguments are frozen so nothing downstream can change what actually runs.
+Calls listed in `allow.tools`, bash commands matching a pattern in
+`allow.bash`, or tools from an MCP server listed in `allow.mcp`, skip the
+reviewer entirely. `write` and `edit` calls also skip review when their
+target path resolves inside the shared scratchpad root from `jpi-scratchpad`
+— see `allow.scratchpad` below. Once a call passes review, its arguments are
+frozen so nothing downstream can change what actually runs.
 
 A bash command only skips the reviewer as a whole if every part of it does.
 Guardian parses the command and, when it has a simple shape — one command, or
@@ -69,6 +70,7 @@ guardian {
   allow {
     // tool names that skip review (repeat: tool "name")
     // regexes; a full command match skips review
+    // MCP servers whose tools skip review (repeat: mcp "server")
     // set to #false to disable the built-in read-only command list
     readonly #true
     // set to #false to review scratchpad writes too
@@ -89,6 +91,11 @@ paragraph above) without turning off splitting itself; set it to `#false` if
 you want every part of a split command to need an explicit `allow.bash`
 match. `policy` adds trusted rules on top of the bundled policy (repeat the
 node per line); it does not replace it.
+
+`allow.mcp` skips review for every tool from a named MCP server — repeat the
+node per server, for example `mcp "datadog-prod"`. Use the server name as
+written in `mcp.json`; this covers both the single proxy tool Pi exposes for
+the server and any tools registered directly under that server's name.
 
 `allow.scratchpad` exempts `write` and `edit` calls whose target path
 resolves inside the per-session scratchpad directory that `jpi-scratchpad`

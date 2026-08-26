@@ -11,6 +11,7 @@ function bashConfig(overrides: Partial<ReviewConfig> = {}): ReviewConfig {
   return {
     allowTools: [],
     allowBash: [],
+    allowMcp: [],
     readonly: true,
     ...overrides,
   } as ReviewConfig;

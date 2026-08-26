@@ -13,6 +13,7 @@ import autoReview, {
   isScratchpadWrite,
   isToolAllowlisted,
   isWithinRoot,
+  matchesMcpServer,
   mergeUsage,
   parseReviewerDecision,
   parseReviewerModel,
@@ -174,6 +175,7 @@ test("controller loads schema defaults and creates jpi.kdl when the file is miss
   assert.equal(config.timeoutMs, 10_000);
   assert.deepEqual(config.allowTools, []);
   assert.deepEqual(config.allowBash, []);
+  assert.deepEqual(config.allowMcp, []);
   assert.equal(config.scratchpad, true);
   assert.deepEqual(config.policy, []);
 
@@ -193,6 +195,7 @@ test("controller decodes values and allow lists from a hand-written jpi.kdl sect
       '    tool "read"',
       '    tool "grep"',
       '    bash "^npm test$"',
+      '    mcp "datadog-prod"',
       "  }",
       '  policy "be terse"',
     ].join("\n"),
@@ -212,6 +215,7 @@ test("controller decodes values and allow lists from a hand-written jpi.kdl sect
   assert.deepEqual(config.allowTools, ["read", "grep"]);
   assert.equal(config.allowBash.length, 1);
   assert.equal(config.allowBash[0].source, "^npm test$");
+  assert.deepEqual(config.allowMcp, ["datadog-prod"]);
   assert.equal(
     isToolAllowlisted(config, { toolName: "bash", input: { command: "npm test" } }),
     true,
@@ -285,6 +289,7 @@ test("allowlists are deterministic for tools, full bash commands, and split segm
   const config = {
     allowTools: ["read"],
     allowBash: [{ source: "^npm test$", regex: new RegExp("^npm test$") }],
+    allowMcp: [],
     readonly: true,
   } as ReviewConfig;
 
@@ -301,6 +306,51 @@ test("allowlists are deterministic for tools, full bash commands, and split segm
   assert.equal(
     isToolAllowlisted(config, { toolName: "bash", input: { command: "npm test && echo done" } }),
     true,
+  );
+});
+
+test("matchesMcpServer covers the namespace-proxy and direct-registration tool name shapes", () => {
+  assert.equal(matchesMcpServer("mcp__datadog_prod", "datadog-prod"), true);
+  assert.equal(matchesMcpServer("datadog-prod_search_datadog_logs", "datadog-prod"), true);
+  assert.equal(matchesMcpServer("mcp__datadog-prod_search_datadog_logs", "datadog-prod"), true);
+
+  assert.equal(matchesMcpServer("mcp__datadog_dev", "datadog-prod"), false);
+  assert.equal(matchesMcpServer("datadog-production_search_logs", "datadog-prod"), false);
+  assert.equal(matchesMcpServer("read", "datadog-prod"), false);
+});
+
+test("isToolAllowlisted skips review for MCP tools from an allowlisted server", () => {
+  const config = {
+    allowTools: [],
+    allowBash: [],
+    allowMcp: ["datadog-prod"],
+    readonly: true,
+  } as ReviewConfig;
+
+  assert.equal(
+    isToolAllowlisted(config, { toolName: "mcp__datadog_prod", input: {} }),
+    true,
+  );
+  assert.equal(
+    isToolAllowlisted(config, { toolName: "datadog-prod_search_logs", input: {} }),
+    true,
+  );
+  assert.equal(
+    isToolAllowlisted(config, { toolName: "mcp__datadog-prod_search_logs", input: {} }),
+    true,
+  );
+
+  assert.equal(isToolAllowlisted(config, { toolName: "mcp__datadog_dev", input: {} }), false);
+  assert.equal(
+    isToolAllowlisted(config, { toolName: "datadog-production_x", input: {} }),
+    false,
+  );
+  assert.equal(isToolAllowlisted(config, { toolName: "read", input: { path: "README.md" } }), false);
+
+  const emptyAllowMcp = { ...config, allowMcp: [] } as ReviewConfig;
+  assert.equal(
+    isToolAllowlisted(emptyAllowMcp, { toolName: "mcp__datadog_prod", input: {} }),
+    false,
   );
 });
 

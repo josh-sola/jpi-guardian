@@ -21,6 +21,7 @@ import autoReview, {
   stringifyBoundedJson,
 } from "../extensions/auto-review/index.ts";
 import { REVIEW_POLICY } from "../extensions/auto-review/policy.ts";
+import { BUILT_IN_READONLY_TOOLS } from "../extensions/auto-review/readonly.ts";
 
 // ReviewContext and ReviewConfig are not exported; derive them from the
 // exported functions that take them as parameters.
@@ -354,13 +355,64 @@ test("isToolAllowlisted skips review for MCP tools from an allowlisted server", 
     isToolAllowlisted(config, { toolName: "datadog-production_x", input: {} }),
     false,
   );
-  assert.equal(isToolAllowlisted(config, { toolName: "read", input: { path: "README.md" } }), false);
+  assert.equal(isToolAllowlisted(config, { toolName: "write", input: { path: "README.md" } }), false);
 
   const emptyAllowMcp = { ...config, allowMcp: [] } as ReviewConfig;
   assert.equal(
     isToolAllowlisted(emptyAllowMcp, { toolName: "mcp__datadog_prod", input: {} }),
     false,
   );
+});
+
+test("isToolAllowlisted skips review for every built-in read-only tool by default", () => {
+  const config = {
+    allowTools: [],
+    allowBash: [],
+    allowMcp: [],
+    readonly: true,
+  } as ReviewConfig;
+
+  for (const toolName of BUILT_IN_READONLY_TOOLS) {
+    assert.equal(isToolAllowlisted(config, { toolName, input: {} }), true, toolName);
+  }
+});
+
+test("readonly false reviews the built-in read-only tools again", () => {
+  const config = {
+    allowTools: [],
+    allowBash: [],
+    allowMcp: [],
+    readonly: false,
+  } as ReviewConfig;
+
+  for (const toolName of BUILT_IN_READONLY_TOOLS) {
+    assert.equal(isToolAllowlisted(config, { toolName, input: {} }), false, toolName);
+  }
+});
+
+test("a user allow.tool entry works alongside the built-in read-only tools", () => {
+  const config = {
+    allowTools: ["TaskCreate"],
+    allowBash: [],
+    allowMcp: [],
+    readonly: true,
+  } as ReviewConfig;
+
+  assert.equal(isToolAllowlisted(config, { toolName: "TaskCreate", input: {} }), true);
+  assert.equal(isToolAllowlisted(config, { toolName: "read", input: {} }), true);
+});
+
+test("tool names outside the built-in list stay reviewed by default", () => {
+  const config = {
+    allowTools: [],
+    allowBash: [],
+    allowMcp: [],
+    readonly: true,
+  } as ReviewConfig;
+
+  for (const toolName of ["TaskCreate", "bg_run", "bg_kill", "write"]) {
+    assert.equal(isToolAllowlisted(config, { toolName, input: {} }), false, toolName);
+  }
 });
 
 test("isWithinRoot uses real path containment, not a string prefix match", () => {

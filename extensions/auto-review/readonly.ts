@@ -52,6 +52,21 @@ const ANY_ARGS = new Set([
 
 const ZERO_ARGS_ONLY = new Set(["pwd", "whoami", "alias"]);
 
+export const BUILT_IN_READONLY_TOOLS = new Set([
+  "read",
+  "grep",
+  "find",
+  "ls",
+  "ask_user_question",
+  "bg_status",
+  "bg_logs",
+  "TaskList",
+  "TaskGet",
+  "get_subagent_result",
+  "web_search",
+  "web_fetch",
+]);
+
 const EXACT_ARGV_FORMS: readonly string[][] = [
   ["node", "-v"],
   ["node", "--version"],

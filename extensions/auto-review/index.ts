@@ -18,7 +18,7 @@ import type {
 import { Config, j, scratchpadRoot } from "jpi-base";
 
 import { REVIEW_POLICY } from "./policy.ts";
-import { isReadOnlyCommand } from "./readonly.ts";
+import { BUILT_IN_READONLY_TOOLS, isReadOnlyCommand } from "./readonly.ts";
 import { splitCommand } from "./split.ts";
 
 // The root barrel exports ToolCallEventResult but omits this sibling type
@@ -79,7 +79,7 @@ const guardianSchema = j.node({
         }),
         readonly: j
           .boolean()
-          .describe("set to #false to disable the built-in read-only command list")
+          .describe("set to #false to disable the built-in read-only command and tool allowlists")
           .default(true),
         scratchpad: j
           .boolean()
@@ -292,6 +292,7 @@ export function isToolAllowlisted(
   event: Pick<ToolCallEvent, "toolName" | "input">,
 ): boolean {
   if (config.allowTools.includes(event.toolName)) return true;
+  if (config.readonly && BUILT_IN_READONLY_TOOLS.has(event.toolName)) return true;
   if (config.allowMcp.some((server) => matchesMcpServer(event.toolName, server))) return true;
   if (event.toolName !== "bash") return false;
 

@@ -22,8 +22,9 @@ context as something that can never grant authorization on its own. You can
 add trusted, environment-specific rules on top of it without replacing it.
 
 Calls listed in `allow.tools`, bash commands matching a pattern in
-`allow.bash`, or tools from an MCP server listed in `allow.mcp`, skip the
-reviewer entirely. `write` and `edit` calls also skip review when their
+`allow.bash`, tools from an MCP server listed in `allow.mcp`, or a built-in
+list of read-only tools (see `allow.readonly` below), skip the reviewer
+entirely. `write` and `edit` calls also skip review when their
 target path resolves inside the shared scratchpad root from `jpi-scratchpad`
 — see `allow.scratchpad` below. Once a call passes review, its arguments are
 frozen so nothing downstream can change what actually runs.
@@ -71,7 +72,7 @@ guardian {
     // tool names that skip review (repeat: tool "name")
     // regexes; a full command match skips review
     // MCP servers whose tools skip review (repeat: mcp "server")
-    // set to #false to disable the built-in read-only command list
+    // set to #false to disable the built-in read-only command and tool allowlists
     readonly #true
     // set to #false to review scratchpad writes too
     scratchpad #true
@@ -89,8 +90,14 @@ split part, so anchor them. `allow.readonly` turns off the built-in read-only
 command list (`ls`, `git status`, `cat`, and the like — see the splitting
 paragraph above) without turning off splitting itself; set it to `#false` if
 you want every part of a split command to need an explicit `allow.bash`
-match. `policy` adds trusted rules on top of the bundled policy (repeat the
-node per line); it does not replace it.
+match. The same toggle also gates a built-in list of read-only tool names
+that skip review: `read`, `grep`, `find`, `ls`, `ask_user_question`,
+`bg_status`, `bg_logs`, `TaskList`, `TaskGet`, `get_subagent_result`,
+`web_search`, and `web_fetch`. `web_search`/`web_fetch` are included as
+read-only, but a fetched URL can still carry data outward; if that matters to
+you, set `allow.readonly` to `#false` and add explicit `allow.tool` entries
+for the rest of the list. `policy` adds trusted rules on top of the bundled
+policy (repeat the node per line); it does not replace it.
 
 `allow.mcp` skips review for every tool from a named MCP server — repeat the
 node per server, for example `mcp "datadog-prod"`. Use the server name as

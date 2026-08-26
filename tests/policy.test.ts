@@ -5,22 +5,24 @@ import { REVIEW_POLICY } from "../extensions/auto-review/policy.ts";
 
 test("review policy stays under the size budget", () => {
   const bytes = Buffer.byteLength(REVIEW_POLICY, "utf8");
-  assert.ok(bytes < 14_000, `policy is ${bytes} bytes, expected under 14000`);
+  assert.ok(bytes < 20_000, `policy is ${bytes} bytes, expected under 20000`);
 });
 
 test("review policy states the no-prior-context constraint", () => {
   assert.match(REVIEW_POLICY, /## What you see and don't/);
   assert.match(
     REVIEW_POLICY,
-    /you do not see prior agent actions, tool results, or the agent's own proposals or reasoning/,
+    /you do not see tool calls, tool results, or the agent's internal reasoning/,
   );
 });
 
-test("review policy discloses answered agent questions as shown evidence", () => {
+test("review policy discloses what the transcript now carries", () => {
   assert.match(
     REVIEW_POLICY,
-    /Answers the human gave to questions the agent posed through a question tool are also shown, marked as such/,
+    /a bounded whole-session transcript of the user's own messages with the assistant's prose adjacent to them/,
   );
+  assert.match(REVIEW_POLICY, /answered questionnaire pairs marked as such/);
+  assert.match(REVIEW_POLICY, /recent auto-review denials the user has seen/);
   assert.match(
     REVIEW_POLICY,
     /An answer authorizes only the literal thing the question asked/,

@@ -34,9 +34,12 @@ const COMMAND_NAME = "auto-review";
 const STATUS_KEY = "@jpi-guardian/review-mode";
 const MAX_REVIEW_TOKENS = 220;
 const MAX_TOOL_ARGS_CHARS = 40_000;
-const MAX_TRANSCRIPT_CHARS = 4_000;
-const MAX_USER_MESSAGE_CHARS = 1_200;
-const MAX_USER_MESSAGES = 6;
+const MAX_TRANSCRIPT_CHARS = 16_000;
+const MAX_TRANSCRIPT_MESSAGE_CHARS = 1_200;
+// Reserves room for the session's opening messages (task framing, standing
+// grants) so a long session's tail-favoring fill can't crowd them out entirely.
+const MAX_TRANSCRIPT_HEAD_CHARS = 4_000;
+const MAX_RECENT_DENIALS = 5;
 const MAX_JSON_DEPTH = 4;
 const MAX_JSON_KEYS = 40;
 const MAX_JSON_ITEMS = 20;
@@ -201,6 +204,12 @@ type ReviewerDecision = {
   reason: string;
 };
 
+type DenialRecord = {
+  toolName: string;
+  reason: string;
+  timestamp: number;
+};
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
@@ -210,10 +219,10 @@ function truncateInline(value: string, maxChars: number): string {
   return `${value.slice(0, Math.max(0, maxChars - 1))}…`;
 }
 
-function truncateUserMessage(value: string): string {
-  if (value.length <= MAX_USER_MESSAGE_CHARS) return value;
+function truncateTranscriptText(value: string): string {
+  if (value.length <= MAX_TRANSCRIPT_MESSAGE_CHARS) return value;
   const marker = "\n[… middle content omitted; omitted text cannot authorize actions …]\n";
-  const retained = MAX_USER_MESSAGE_CHARS - marker.length;
+  const retained = MAX_TRANSCRIPT_MESSAGE_CHARS - marker.length;
   const headLength = Math.ceil(retained / 2);
   const tailLength = Math.floor(retained / 2);
   return `${value.slice(0, headLength)}${marker}${value.slice(-tailLength)}`;
@@ -402,7 +411,9 @@ export function stringifyBoundedJson(value: unknown, maxChars = MAX_TOOL_ARGS_CH
   return JSON.stringify({ truncatedByReviewHarness: true, omittedChars: json.length });
 }
 
-function extractUserText(content: unknown): string {
+// Shared by user and assistant messages: keeping only "text" parts is what
+// strips tool-use and thinking blocks from assistant content.
+function extractMessageText(content: unknown): string {
   if (typeof content === "string") return content.trim();
   if (!Array.isArray(content)) return "";
 
@@ -454,54 +465,104 @@ export function renderQuestionAnswers(details: unknown): string {
 }
 
 type TranscriptItem = {
+  role: "user" | "assistant" | "question";
   text: string;
-  answered: boolean;
 };
 
+function formatTranscriptItem(item: TranscriptItem): string {
+  const label = item.role === "question" ? "[user] (answered agent's question)" : `[${item.role}]`;
+  return `${label}\n${item.text}`;
+}
+
+// Each loop always admits at least one item even if that single item alone
+// exceeds its share, so neither the head nor the tail is ever left empty.
+function splitHeadAndTail(
+  items: TranscriptItem[],
+  maxChars: number,
+  headBudget: number,
+): { head: TranscriptItem[]; tail: TranscriptItem[]; omittedCount: number } {
+  let headChars = 0;
+  let headEnd = 0;
+  while (headEnd < items.length) {
+    const next = headChars + items[headEnd].text.length;
+    if (headEnd > 0 && next > headBudget) break;
+    headChars = next;
+    headEnd += 1;
+  }
+
+  let tailChars = 0;
+  let tailStart = items.length;
+  const tailBudget = maxChars - headChars;
+  while (tailStart > headEnd) {
+    const next = tailChars + items[tailStart - 1].text.length;
+    if (tailStart < items.length && next > tailBudget) break;
+    tailChars = next;
+    tailStart -= 1;
+  }
+
+  if (tailStart <= headEnd) return { head: items, tail: [], omittedCount: 0 };
+  return {
+    head: items.slice(0, headEnd),
+    tail: items.slice(tailStart),
+    omittedCount: tailStart - headEnd,
+  };
+}
+
+// Tool calls, tool call summaries, and tool results are deliberately excluded
+// throughout — they stay outside the injection surface the reviewer trusts.
 export function buildRecentUserTranscript(entries: SessionEntryLike[]): string {
   const items: TranscriptItem[] = [];
+  let pendingAssistantText: string | undefined;
+
   for (const entry of entries) {
     if (entry.type !== "message" || !entry.message) continue;
     const { role } = entry.message;
 
+    if (role === "assistant") {
+      pendingAssistantText = extractMessageText(entry.message.content);
+      continue;
+    }
+
     if (role === "user") {
-      const text = truncateUserMessage(extractUserText(entry.message.content));
-      if (text) items.push({ text, answered: false });
-    } else if (
+      const text = truncateTranscriptText(extractMessageText(entry.message.content));
+      if (text) {
+        if (pendingAssistantText) {
+          items.push({ role: "assistant", text: truncateTranscriptText(pendingAssistantText) });
+        }
+        items.push({ role: "user", text });
+      }
+      pendingAssistantText = undefined;
+      continue;
+    }
+
+    if (
       role === "toolResult" &&
       typeof entry.message.toolName === "string" &&
       QUESTION_TOOL_NAMES.has(entry.message.toolName)
     ) {
-      const text = truncateUserMessage(renderQuestionAnswers(entry.message.details));
-      if (text) items.push({ text, answered: true });
+      const text = truncateTranscriptText(renderQuestionAnswers(entry.message.details));
+      if (text) items.push({ role: "question", text });
     }
   }
 
-  const selected: TranscriptItem[] = [];
-  let total = 0;
+  if (items.length === 0) return "[no recent user text]";
 
-  for (let index = items.length - 1; index >= 0; index -= 1) {
-    const item = items[index];
-    const nextTotal = total + item.text.length;
-    if (selected.length > 0 && nextTotal > MAX_TRANSCRIPT_CHARS) break;
-    if (selected.length >= MAX_USER_MESSAGES) break;
-    selected.unshift(item);
-    total = nextTotal;
+  const totalChars = items.reduce((sum, item) => sum + item.text.length, 0);
+  if (totalChars <= MAX_TRANSCRIPT_CHARS) {
+    return items.map(formatTranscriptItem).join("\n\n");
   }
 
-  if (selected.length === 0) return "[no recent user text]";
+  const { head, tail, omittedCount } = splitHeadAndTail(
+    items,
+    MAX_TRANSCRIPT_CHARS,
+    MAX_TRANSCRIPT_HEAD_CHARS,
+  );
+  if (omittedCount === 0) return items.map(formatTranscriptItem).join("\n\n");
 
-  const omittedMessages = items.length - selected.length;
-  const omissionMarker =
-    omittedMessages > 0
-      ? `[… ${omittedMessages} earlier user message(s) omitted; omitted messages cannot authorize actions or establish attribution …]\n\n`
-      : "";
-  return `${omissionMarker}${selected
-    .map(
-      (item, index) =>
-        `User ${index + 1}${item.answered ? " (answered agent's question)" : ""}:\n${item.text}`,
-    )
-    .join("\n\n")}`;
+  const omissionMarker = `[… ${omittedCount} earlier message(s) omitted; omitted messages cannot authorize actions or establish attribution …]`;
+  return [...head.map(formatTranscriptItem), omissionMarker, ...tail.map(formatTranscriptItem)].join(
+    "\n\n",
+  );
 }
 
 function getReviewerText(response: AssistantMessage): string {
@@ -630,17 +691,28 @@ async function buildScriptSection(command: string, cwd: string): Promise<string 
 async function buildReviewRequest(
   ctx: ReviewContext,
   event: Pick<ToolCallEvent, "toolName" | "input">,
+  denials: DenialRecord[],
 ): Promise<string> {
   const transcript = buildRecentUserTranscript(ctx.sessionManager.getBranch());
   const argsJson = stringifyBoundedJson(event.input);
   const parts = [
     "Recent user transcript (truncation markers are authorization boundaries):",
     transcript,
+  ];
+
+  if (denials.length > 0) {
+    parts.push(
+      "Recent auto-review denials the user has seen (a later user affirmation may refer to these):",
+      denials.map((denial) => `- ${denial.toolName}: ${denial.reason}`).join("\n"),
+    );
+  }
+
+  parts.push(
     `Current working directory: ${ctx.cwd}`,
     `Tool name: ${event.toolName}`,
     "Tool arguments JSON:",
     argsJson,
-  ];
+  );
 
   if (event.toolName === "bash") {
     const input: unknown = event.input;
@@ -700,6 +772,9 @@ export class AutoReviewController {
   consecutiveReviewFailures = 0;
   openCircuitReason: string | undefined;
   readonly pendingUsage = new Map<string, Usage>();
+  // Lives for the whole session, unlike consecutiveExplicitDenials: a later
+  // user affirmation may refer to a denial from an earlier agent run.
+  readonly recentDenials: DenialRecord[] = [];
 
   constructor(options: ControllerOptions = {}) {
     this.cfg = new Config("guardian", guardianSchema, options.env, options.homeDirectory);
@@ -735,6 +810,11 @@ export class AutoReviewController {
 
   resetDenials(): void {
     this.consecutiveExplicitDenials = 0;
+  }
+
+  recordDenial(toolName: string, reason: string): void {
+    this.recentDenials.push({ toolName, reason, timestamp: this.now() });
+    if (this.recentDenials.length > MAX_RECENT_DENIALS) this.recentDenials.shift();
   }
 
   resetReviewFailures(): void {
@@ -902,7 +982,9 @@ export class AutoReviewController {
           messages: [
             {
               role: "user",
-              content: [{ type: "text", text: await buildReviewRequest(ctx, event) }],
+              content: [
+                { type: "text", text: await buildReviewRequest(ctx, event, this.recentDenials) },
+              ],
               timestamp: this.now(),
             },
           ],
@@ -952,6 +1034,7 @@ export class AutoReviewController {
     }
 
     this.consecutiveExplicitDenials += 1;
+    this.recordDenial(event.toolName, decision.reason);
     // Pi only terminates early when every tool result in the current batch sets
     // terminate, so an allowed sibling in a parallel batch delays the stop by one
     // batch. The open circuit still blocks (and terminates) every later call.

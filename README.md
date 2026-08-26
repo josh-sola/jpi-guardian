@@ -6,11 +6,15 @@ A Pi coding-agent plugin that reviews risky tool calls before they run.
 
 The `auto-review` extension sits in front of every tool call Pi's agent
 makes. Before a non-allowlisted call runs, it sends the call (tool name,
-arguments, current directory, and a bounded slice of recent user messages) to
+arguments, current directory, and a bounded whole-session transcript) to
 a separate reviewer model and asks for a single allow-or-deny decision. The
-transcript also includes the human's answers to questions the agent asked
-through `ask_user_question`, question text and all, marked as such — but an
-answer only authorizes exactly what its question asked. A
+transcript holds the user's messages with the assistant prose adjacent to
+them — so "shall I do X?" followed by "yes" reads as consent to X — plus the
+human's answers to questions the agent asked through `ask_user_question`,
+marked as such; an answer only authorizes exactly what its question asked.
+Tool calls and tool results never enter the transcript. The request also
+carries guardian's own recent denials, so a user's go-ahead after a denial
+reads as informed consent to the denied action. A
 denial blocks the call and tells the agent not to work around it; three
 denials in a row without an approved call in between stop the run so the
 agent asks the user instead of retrying.

@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { readFile, stat } from "node:fs/promises";
 import { isAbsolute, relative, resolve } from "node:path";
 
 import type {
@@ -32,15 +33,21 @@ interface ToolResultEventResult {
 const COMMAND_NAME = "auto-review";
 const STATUS_KEY = "@jpi-guardian/review-mode";
 const MAX_REVIEW_TOKENS = 220;
-const MAX_TOOL_ARGS_CHARS = 4_000;
+const MAX_TOOL_ARGS_CHARS = 40_000;
 const MAX_TRANSCRIPT_CHARS = 4_000;
 const MAX_USER_MESSAGE_CHARS = 1_200;
 const MAX_USER_MESSAGES = 6;
 const MAX_JSON_DEPTH = 4;
 const MAX_JSON_KEYS = 40;
 const MAX_JSON_ITEMS = 20;
-const MAX_JSON_STRING = 4_000;
+const MAX_JSON_STRING = 40_000;
 const MAX_REASON_CHARS = 220;
+const MAX_SCRIPT_FILES = 3;
+const MAX_SCRIPT_TOTAL_CHARS = 20_000;
+// Above this, skip rather than read-then-truncate: not worth paying the read
+// cost for a file the harness is about to cut down to a sliver anyway.
+const MAX_SCRIPT_FILE_BYTES = 1_000_000;
+const SCRIPT_BINARY_SNIFF_BYTES = 8_000;
 // Canonical tool name from @juicesharp/rpiv-ask-user-question. Its
 // toolResult details carry both question and answer, so no pairing with
 // the originating toolCall is needed.
@@ -340,7 +347,7 @@ function toJsonValue(value: unknown, depth = 0, seen = new WeakSet<object>()): u
   if (typeof value === "string") {
     if (value.length <= MAX_JSON_STRING) return value;
     const omitted = value.length - MAX_JSON_STRING;
-    return `${value.slice(0, MAX_JSON_STRING)}\n[… truncated ${omitted} chars]`;
+    return `${value.slice(0, MAX_JSON_STRING)}\n[… ${omitted} chars omitted by the review harness]`;
   }
   if (typeof value === "bigint") return `${value}n`;
   if (typeof value === "undefined") return "[undefined]";
@@ -380,7 +387,7 @@ export function stringifyBoundedJson(value: unknown, maxChars = MAX_TOOL_ARGS_CH
   while (preview.length > 0) {
     const bounded = JSON.stringify(
       {
-        truncated: true,
+        truncatedByReviewHarness: true,
         omittedChars: json.length - preview.length,
         preview,
       },
@@ -391,7 +398,7 @@ export function stringifyBoundedJson(value: unknown, maxChars = MAX_TOOL_ARGS_CH
     preview = preview.slice(0, Math.max(0, preview.length - (bounded.length - maxChars) - 1));
   }
 
-  return JSON.stringify({ truncated: true, omittedChars: json.length });
+  return JSON.stringify({ truncatedByReviewHarness: true, omittedChars: json.length });
 }
 
 function extractUserText(content: unknown): string {
@@ -563,20 +570,85 @@ function buildSystemPrompt(policy: string[]): string {
   return `${REVIEW_POLICY}\n\nAdditional trusted reviewer instructions:\n${policy.map((line) => `- ${line}`).join("\n")}`;
 }
 
-function buildReviewRequest(
+// Quoted-or-bareword split, not a shell parse: good enough to catch the
+// common "bash script.sh" / "python3 tools/run.py" shapes without building a
+// second command grammar next to split.ts's tree-sitter one.
+function extractCommandTokens(command: string): string[] {
+  const matches = command.match(/"[^"]*"|'[^']*'|\S+/g) ?? [];
+  return matches.map((token) =>
+    (token.startsWith('"') && token.endsWith('"')) || (token.startsWith("'") && token.endsWith("'"))
+      ? token.slice(1, -1)
+      : token,
+  );
+}
+
+async function readScriptFile(path: string, budget: number): Promise<string | undefined> {
+  try {
+    const stats = await stat(path);
+    if (!stats.isFile() || stats.size > MAX_SCRIPT_FILE_BYTES) return undefined;
+
+    const buffer = await readFile(path);
+    if (buffer.subarray(0, SCRIPT_BINARY_SNIFF_BYTES).includes(0)) return undefined;
+
+    const text = buffer.toString("utf8");
+    if (text.length <= budget) return text;
+    const omitted = text.length - budget;
+    return `${text.slice(0, budget)}\n[… ${omitted} chars omitted by the review harness]`;
+  } catch {
+    return undefined;
+  }
+}
+
+async function buildScriptSection(command: string, cwd: string): Promise<string | undefined> {
+  try {
+    const tokens = [...new Set(extractCommandTokens(command))];
+    const sections: string[] = [];
+    let remaining = MAX_SCRIPT_TOTAL_CHARS;
+
+    for (const token of tokens) {
+      if (sections.length >= MAX_SCRIPT_FILES || remaining <= 0) break;
+
+      const target = isAbsolute(token) ? token : resolve(cwd, token);
+      const content = await readScriptFile(target, remaining);
+      if (content === undefined) continue;
+
+      sections.push(`--- ${target} ---\n${content}`);
+      remaining -= content.length;
+    }
+
+    if (sections.length === 0) return undefined;
+    return [
+      "Script contents (read by the review harness from disk, not supplied by the agent):",
+      ...sections,
+    ].join("\n\n");
+  } catch {
+    return undefined;
+  }
+}
+
+async function buildReviewRequest(
   ctx: ReviewContext,
   event: Pick<ToolCallEvent, "toolName" | "input">,
-): string {
+): Promise<string> {
   const transcript = buildRecentUserTranscript(ctx.sessionManager.getBranch());
   const argsJson = stringifyBoundedJson(event.input);
-  return [
+  const parts = [
     "Recent user transcript (truncation markers are authorization boundaries):",
     transcript,
     `Current working directory: ${ctx.cwd}`,
     `Tool name: ${event.toolName}`,
     "Tool arguments JSON:",
     argsJson,
-  ].join("\n\n");
+  ];
+
+  if (event.toolName === "bash") {
+    const input: unknown = event.input;
+    const command = isRecord(input) && typeof input.command === "string" ? input.command : undefined;
+    const scriptSection = command ? await buildScriptSection(command, ctx.cwd) : undefined;
+    if (scriptSection) parts.push(scriptSection);
+  }
+
+  return parts.join("\n\n");
 }
 
 function buildConfigGuidance(detail: string, path: string): ToolCallEventResult {
@@ -829,7 +901,7 @@ export class AutoReviewController {
           messages: [
             {
               role: "user",
-              content: [{ type: "text", text: buildReviewRequest(ctx, event) }],
+              content: [{ type: "text", text: await buildReviewRequest(ctx, event) }],
               timestamp: this.now(),
             },
           ],

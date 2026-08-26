@@ -84,6 +84,7 @@ function makeEntries(): SessionEntryLike[] {
 }
 
 type CreateContextOptions = {
+  cwd?: string;
   entries?: SessionEntryLike[];
   find?: (provider: string, modelId: string) => unknown;
   hasConfiguredAuth?: (model: unknown) => boolean;
@@ -112,7 +113,7 @@ function createContext(options: CreateContextOptions) {
   }[] = [];
 
   const ctx: ReviewCommandContext = {
-    cwd: "/repo/project",
+    cwd: options.cwd ?? "/repo/project",
     hasUI: true,
     ui: {
       notify(message, level) {
@@ -157,6 +158,14 @@ async function withTempEnv(t: TestContext) {
     await rm(dir, { recursive: true, force: true });
   });
   return { dir, env: { PI_CODING_AGENT_DIR: dir } };
+}
+
+async function withTempCwd(t: TestContext): Promise<string> {
+  const dir = await mkdtemp(join(tmpdir(), "auto-review-cwd-"));
+  t.onTestFinished(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+  return dir;
 }
 
 async function writeGuardianConfig(dir: string, body: string) {
@@ -496,7 +505,10 @@ test("review policy retains the Guardian hard/soft block structure and outcome d
   assert.match(REVIEW_POLICY, /## Low-risk actions and exceptions/);
 
   assert.match(REVIEW_POLICY, /## The consent bar/);
-  assert.match(REVIEW_POLICY, /Naming the enclosing task is not naming the destructive step/);
+  assert.match(REVIEW_POLICY, /SOFT BLOCK rules clear at two tiers/);
+  assert.match(REVIEW_POLICY, /Tier 1 — ordinary actions/);
+  assert.match(REVIEW_POLICY, /Tier 2 — high-stakes actions/);
+  assert.match(REVIEW_POLICY, /Naming the enclosing task is not enough at this tier/);
   assert.match(REVIEW_POLICY, /Only the user's own words, and their answers to agent-posed questions, count/);
   assert.match(
     REVIEW_POLICY,
@@ -781,8 +793,25 @@ test("bounded tool arguments disclose truncation without exceeding the limit", (
   const bounded = stringifyBoundedJson({ command: `echo ${"x".repeat(5_000)}` }, 500);
 
   assert.ok(bounded.length <= 500);
-  assert.match(bounded, /"truncated": true/);
+  assert.match(bounded, /"truncatedByReviewHarness": true/);
   assert.match(bounded, /"omittedChars":/);
+});
+
+test("bounded tool arguments no longer truncate at the old 4,000-char cap", () => {
+  const value = "z".repeat(10_000);
+  const bounded = stringifyBoundedJson({ content: value });
+
+  assert.doesNotMatch(bounded, /omitted by the review harness/);
+  assert.ok(bounded.includes(value), "a 10,000-char value must pass through the new 40,000-char cap untouched");
+});
+
+test("bounded tool arguments attribute in-string truncation to the review harness", () => {
+  const longValue = "y".repeat(50_000);
+  // A generous outer cap keeps this exercising toJsonValue's per-string
+  // truncation, not stringifyBoundedJson's own outer preview fallback.
+  const bounded = stringifyBoundedJson({ content: longValue }, 45_000);
+
+  assert.match(bounded, /\[… \d+ chars omitted by the review harness\]/);
 });
 
 test("usage merging preserves optional provider breakdown semantics", () => {
@@ -858,6 +887,143 @@ test("reviewer allow passes through and reviewer usage merges into tool results"
   assert.equal(sessionIdCalls, 1);
   assert.equal(calls[0].options.sessionId, "review-session-1");
   assert.equal(calls[1].options.sessionId, "review-session-1");
+});
+
+test("bash review requests inline an existing script named on the command line", async (t) => {
+  const { dir, env } = await withTempEnv(t);
+  await writeGuardianConfig(dir, '  model "openai/reviewer"');
+  const cwd = await withTempCwd(t);
+  await writeFile(join(cwd, "deploy.sh"), "echo hello from deploy\n", "utf8");
+
+  const controller = new AutoReviewController({ env });
+  const { ctx, calls } = createContext({
+    cwd,
+    complete: async () => makeAssistant('{"decision":"allow","reason":"routine"}', makeUsage(1)),
+  });
+
+  await controller.handleToolCall(
+    {
+      type: "tool_call",
+      toolCallId: "script-inline",
+      toolName: "bash",
+      input: { command: "bash deploy.sh" },
+    },
+    ctx,
+  );
+
+  const requestText = calls[0].context.messages[0].content[0].text;
+  assert.match(
+    requestText,
+    /Script contents \(read by the review harness from disk, not supplied by the agent\):/,
+  );
+  assert.match(requestText, /--- .*deploy\.sh ---/);
+  assert.match(requestText, /echo hello from deploy/);
+});
+
+test("bash review requests skip missing, binary, and oversize scripts and cap at three files", async (t) => {
+  const { dir, env } = await withTempEnv(t);
+  await writeGuardianConfig(dir, '  model "openai/reviewer"');
+  const cwd = await withTempCwd(t);
+
+  await writeFile(
+    join(cwd, "bin.dat"),
+    Buffer.concat([Buffer.from("junk"), Buffer.from([0]), Buffer.from("more")]),
+  );
+  await writeFile(join(cwd, "huge.sh"), "a".repeat(1_500_000), "utf8");
+  await writeFile(join(cwd, "script1.sh"), "content one", "utf8");
+  await writeFile(join(cwd, "script2.sh"), "content two", "utf8");
+  await writeFile(join(cwd, "script3.sh"), "content three", "utf8");
+  await writeFile(join(cwd, "script4.sh"), "content four", "utf8");
+
+  const controller = new AutoReviewController({ env });
+  const { ctx, calls } = createContext({
+    cwd,
+    complete: async () => makeAssistant('{"decision":"allow","reason":"routine"}', makeUsage(1)),
+  });
+
+  await controller.handleToolCall(
+    {
+      type: "tool_call",
+      toolCallId: "script-bounds",
+      toolName: "bash",
+      input: {
+        command: "bash missing.sh bin.dat huge.sh script1.sh script2.sh script3.sh script4.sh",
+      },
+    },
+    ctx,
+  );
+
+  const requestText = calls[0].context.messages[0].content[0].text;
+  assert.match(requestText, /content one/);
+  assert.match(requestText, /content two/);
+  assert.match(requestText, /content three/);
+  assert.doesNotMatch(requestText, /content four/);
+  assert.doesNotMatch(requestText, /junk/);
+});
+
+test("bash review requests head-truncate script contents within the shared 20K budget", async (t) => {
+  const { dir, env } = await withTempEnv(t);
+  await writeGuardianConfig(dir, '  model "openai/reviewer"');
+  const cwd = await withTempCwd(t);
+
+  const first = "A".repeat(15_000);
+  const second = "B".repeat(15_000);
+  const third = "C".repeat(15_000);
+  await writeFile(join(cwd, "first.sh"), first, "utf8");
+  await writeFile(join(cwd, "second.sh"), second, "utf8");
+  await writeFile(join(cwd, "third.sh"), third, "utf8");
+
+  const controller = new AutoReviewController({ env });
+  const { ctx, calls } = createContext({
+    cwd,
+    complete: async () => makeAssistant('{"decision":"allow","reason":"routine"}', makeUsage(1)),
+  });
+
+  await controller.handleToolCall(
+    {
+      type: "tool_call",
+      toolCallId: "script-budget",
+      toolName: "bash",
+      input: { command: "bash first.sh second.sh third.sh" },
+    },
+    ctx,
+  );
+
+  const requestText = calls[0].context.messages[0].content[0].text;
+  assert.ok(requestText.includes(first), "the first file fits fully inside the 20K budget");
+  assert.ok(
+    requestText.includes(`${"B".repeat(5_000)}\n[… 10000 chars omitted by the review harness]`),
+    "the second file is head-truncated once the remaining budget runs out",
+  );
+  assert.ok(
+    !requestText.includes(third) && !requestText.includes("third.sh ---"),
+    "the third file is dropped once the budget is exhausted",
+  );
+});
+
+test("a bash call with no file tokens produces no script section", async (t) => {
+  const { dir, env } = await withTempEnv(t);
+  await writeGuardianConfig(dir, '  model "openai/reviewer"');
+  const cwd = await withTempCwd(t);
+
+  const controller = new AutoReviewController({ env });
+  const { ctx, calls } = createContext({
+    cwd,
+    complete: async () => makeAssistant('{"decision":"allow","reason":"routine"}', makeUsage(1)),
+  });
+
+  await controller.handleToolCall(
+    {
+      type: "tool_call",
+      toolCallId: "no-script",
+      toolName: "bash",
+      input: { command: "npm test -- --watch=false" },
+    },
+    ctx,
+  );
+
+  const requestText = calls[0].context.messages[0].content[0].text;
+  assert.doesNotMatch(requestText, /Script contents/);
 });
 
 test("scratchpad-root writes and edits skip review while other calls stay reviewed", async (t) => {

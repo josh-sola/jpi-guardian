@@ -5,11 +5,12 @@ import { join } from "node:path";
 import { test, type TestContext } from "vite-plus/test";
 
 import type { AssistantMessage, Usage } from "@earendil-works/pi-ai";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { CustomEntry, ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
 
 import autoReview, {
   AutoReviewController,
   buildRecentUserTranscript,
+  formatReviewDuration,
   isMcpGatewayIntrospection,
   isScratchpadWrite,
   isToolAllowlisted,
@@ -19,6 +20,8 @@ import autoReview, {
   parseReviewerDecision,
   parseReviewerModel,
   renderQuestionAnswers,
+  renderReviewedEntry,
+  REVIEWED_ENTRY_TYPE,
   stringifyBoundedJson,
 } from "../extensions/auto-review/index.ts";
 import { REVIEW_POLICY } from "../extensions/auto-review/policy.ts";
@@ -1579,10 +1582,14 @@ test("session toggles preserve pending reviewer usage", async (t) => {
 test("extension resets breaker state at agent-run boundaries and patches final tool messages", () => {
   const events: string[] = [];
   const commands: string[] = [];
+  const entryRenderers: string[] = [];
   // Exercises only the slice of ExtensionAPI that autoReview calls.
   autoReview({
     registerCommand(name: string) {
       commands.push(name);
+    },
+    registerEntryRenderer(customType: string) {
+      entryRenderers.push(customType);
     },
     on(name: string) {
       events.push(name);
@@ -1590,9 +1597,152 @@ test("extension resets breaker state at agent-run boundaries and patches final t
   } as unknown as ExtensionAPI);
 
   assert.deepEqual(commands, ["guardian"]);
+  assert.deepEqual(entryRenderers, [REVIEWED_ENTRY_TYPE]);
   assert.ok(events.includes("before_agent_start"));
   assert.ok(events.includes("message_end"));
+  // One handler merges reviewer usage into the tool result, the other
+  // annotates the transcript when that result was actually reviewed.
+  assert.equal(events.filter((name) => name === "tool_result").length, 2);
   assert.equal(events.includes("turn_start"), false);
+});
+
+test("wiring: a tool_result for a call that was never reviewed appends nothing", () => {
+  const handlers: Record<string, ((event: unknown) => unknown)[]> = {};
+  const appendEntryCalls: { customType: string; data: unknown }[] = [];
+  autoReview({
+    registerCommand() {},
+    registerEntryRenderer() {},
+    appendEntry(customType: string, data?: unknown) {
+      appendEntryCalls.push({ customType, data });
+    },
+    on(name: string, handler: (event: unknown) => unknown) {
+      (handlers[name] ??= []).push(handler);
+    },
+  } as unknown as ExtensionAPI);
+
+  for (const handler of handlers.tool_result ?? []) {
+    handler({
+      type: "tool_result",
+      toolCallId: "never-reviewed",
+      toolName: "read",
+      input: {},
+      content: [],
+      details: undefined,
+      isError: false,
+    });
+  }
+
+  assert.deepEqual(appendEntryCalls, []);
+});
+
+test("formatReviewDuration keeps one decimal under 10s and whole seconds at or above it", () => {
+  assert.equal(formatReviewDuration(800), "0.8s");
+  assert.equal(formatReviewDuration(1234), "1.2s");
+  assert.equal(formatReviewDuration(12000), "12s");
+});
+
+test("renderReviewedEntry renders one dim annotation line with the formatted duration", () => {
+  const fakeTheme = { fg: (_color: string, text: string) => text } as unknown as Theme;
+  const entry = {
+    type: "custom",
+    customType: REVIEWED_ENTRY_TYPE,
+    data: { durationMs: 800 },
+  } as unknown as CustomEntry<{ durationMs: number }>;
+
+  const component = renderReviewedEntry(entry, { expanded: false }, fakeTheme);
+  assert.ok(component);
+  const lines = component!.render(80);
+  assert.match(lines.join("\n"), /⛨ reviewed · 0\.8s/);
+});
+
+test("renderReviewedEntry renders nothing when the entry carries no duration", () => {
+  const fakeTheme = { fg: (_color: string, text: string) => text } as unknown as Theme;
+  const entry = { type: "custom", customType: REVIEWED_ENTRY_TYPE } as unknown as CustomEntry<{
+    durationMs: number;
+  }>;
+
+  assert.equal(renderReviewedEntry(entry, { expanded: false }, fakeTheme), undefined);
+});
+
+test("a reviewed-and-allowed call records the exact reviewer duration for the tool_result handler to consume", async (t) => {
+  const { env } = await withTempEnv(t);
+  const clockValues = [1_000, 1_800];
+  const controller = new AutoReviewController({ env, now: () => clockValues.shift()! });
+  const { ctx } = createContext({
+    complete: async () => makeAssistant('{"decision":"allow","reason":"routine"}', makeUsage(1)),
+  });
+
+  const result = await controller.handleToolCall(
+    { type: "tool_call", toolCallId: "reviewed-1", toolName: "bash", input: { command: "npm test" } },
+    ctx,
+  );
+
+  assert.equal(result, undefined);
+  assert.equal(controller.takeReviewDuration("reviewed-1"), 800);
+  // Consumed exactly once, so a duplicate tool_result never re-annotates.
+  assert.equal(controller.takeReviewDuration("reviewed-1"), undefined);
+});
+
+test("an allowlisted call never enters the reviewed-duration map", async (t) => {
+  const { dir, env } = await withTempEnv(t);
+  await writeGuardianConfig(
+    dir,
+    ['  model "openai/reviewer"', "  allow {", '    tool "read"', "  }"].join("\n"),
+  );
+  const controller = new AutoReviewController({ env });
+  const { ctx, calls } = createContext({
+    complete: async () => makeAssistant('{"decision":"allow","reason":"routine"}', makeUsage(1)),
+  });
+
+  const result = await controller.handleToolCall(
+    { type: "tool_call", toolCallId: "allowlisted-1", toolName: "read", input: { path: "a.txt" } },
+    ctx,
+  );
+
+  assert.equal(result, undefined);
+  assert.equal(calls.length, 0);
+  assert.equal(controller.takeReviewDuration("allowlisted-1"), undefined);
+});
+
+test("a denied call never enters the reviewed-duration map", async (t) => {
+  const { dir, env } = await withTempEnv(t);
+  await writeGuardianConfig(dir, '  model "openai/reviewer"');
+  const controller = new AutoReviewController({ env });
+  const { ctx } = createContext({
+    complete: async () => makeAssistant('{"decision":"deny","reason":"too risky"}', makeUsage(1)),
+  });
+
+  const result = await controller.handleToolCall(
+    { type: "tool_call", toolCallId: "denied-1", toolName: "bash", input: { command: "rm -rf /" } },
+    ctx,
+  );
+
+  assert.equal(result?.block, true);
+  assert.equal(controller.takeReviewDuration("denied-1"), undefined);
+});
+
+test("a reviewer timeout never enters the reviewed-duration map", async (t) => {
+  const { dir, env } = await withTempEnv(t);
+  await writeGuardianConfig(dir, ['  model "openai/reviewer"', "  timeout-ms 20"].join("\n"));
+  const controller = new AutoReviewController({ env });
+  const { ctx } = createContext({
+    complete: async (_model, _context, completeOptions) =>
+      new Promise<AssistantMessage>((_resolve, reject) => {
+        (completeOptions as { signal: AbortSignal }).signal.addEventListener(
+          "abort",
+          () => reject(new Error("aborted")),
+          { once: true },
+        );
+      }),
+  });
+
+  const result = await controller.handleToolCall(
+    { type: "tool_call", toolCallId: "timeout-1", toolName: "bash", input: { command: "sleep 1" } },
+    ctx,
+  );
+
+  assert.equal(result?.block, true);
+  assert.equal(controller.takeReviewDuration("timeout-1"), undefined);
 });
 
 test("commands report status, reload config, and toggle session overrides without writing config", async (t) => {

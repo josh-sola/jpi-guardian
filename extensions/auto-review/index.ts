@@ -10,11 +10,15 @@ import type {
   Usage,
 } from "@earendil-works/pi-ai";
 import type {
+  CustomEntry,
+  EntryRenderOptions,
   ExtensionAPI,
+  Theme,
   ToolCallEvent,
   ToolCallEventResult,
   ToolResultEvent,
 } from "@earendil-works/pi-coding-agent";
+import { type Component, Text } from "@earendil-works/pi-tui";
 import { Config, j, scratchpadRoot } from "jpi-base";
 
 import { REVIEW_POLICY } from "./policy.ts";
@@ -38,6 +42,7 @@ interface ToolResultEventResult {
 
 const COMMAND_NAME = "guardian";
 const STATUS_KEY = "@jpi-guardian/review-mode";
+export const REVIEWED_ENTRY_TYPE = "guardian-reviewed";
 const MAX_REVIEW_TOKENS = 220;
 const MAX_TOOL_ARGS_CHARS = 40_000;
 const MAX_TRANSCRIPT_CHARS = 16_000;
@@ -243,6 +248,15 @@ function freezeToolInput(value: unknown, seen = new WeakSet<object>()): void {
 
 function normalizeReason(value: string): string {
   return truncateInline(value.replace(/\s+/g, " ").trim(), MAX_REASON_CHARS);
+}
+
+// Sub-10s durations keep one decimal of precision (reviews are fast enough
+// that whole seconds alone would hide most of the variation); 10s and above
+// round to a whole second, since that precision stops being useful.
+export function formatReviewDuration(durationMs: number): string {
+  const seconds = durationMs / 1000;
+  if (seconds < 10) return `${(Math.round(seconds * 10) / 10).toFixed(1)}s`;
+  return `${Math.round(seconds)}s`;
 }
 
 export function parseReviewerModel(value: unknown): ReviewerModelSpec | undefined {
@@ -788,6 +802,9 @@ export class AutoReviewController {
   // Lives for the whole session, unlike consecutiveExplicitDenials: a later
   // user affirmation may refer to a denial from an earlier agent run.
   readonly recentDenials: DenialRecord[] = [];
+  // Set only when the reviewer model actually ran and allowed the call, so
+  // the transcript annotation never appears for allowlisted or denied calls.
+  readonly reviewDurations = new Map<string, number>();
 
   constructor(options: ControllerOptions = {}) {
     this.cfg = new Config("guardian", guardianSchema, options.env, options.homeDirectory);
@@ -1001,6 +1018,7 @@ export class AutoReviewController {
 
     const basePrompt = await this.loadPromptBase(ctx);
 
+    const startedAt = this.now();
     let response: AssistantMessage;
     try {
       response = await ctx.modelRegistry.complete(
@@ -1013,7 +1031,7 @@ export class AutoReviewController {
               content: [
                 { type: "text", text: await buildReviewRequest(ctx, event, this.recentDenials) },
               ],
-              timestamp: this.now(),
+              timestamp: startedAt,
             },
           ],
         },
@@ -1034,6 +1052,7 @@ export class AutoReviewController {
         error instanceof Error ? normalizeReason(error.message) : normalizeReason(String(error));
       return this.recordReviewFailure(message || "reviewer error");
     }
+    const durationMs = this.now() - startedAt;
 
     this.rememberUsage(event.toolCallId, response.usage);
 
@@ -1058,6 +1077,7 @@ export class AutoReviewController {
     if (decision.decision === "allow") {
       this.resetDenials();
       freezeToolInput(event.input);
+      this.reviewDurations.set(event.toolCallId, durationMs);
       return undefined;
     }
 
@@ -1078,6 +1098,15 @@ export class AutoReviewController {
     return { usage: mergeUsage(event.usage, usage) };
   }
 
+  // Returns the measured reviewer duration for a call the reviewer actually
+  // allowed, and forgets it, so a result can only ever be annotated once.
+  takeReviewDuration(toolCallId: string): number | undefined {
+    const durationMs = this.reviewDurations.get(toolCallId);
+    if (durationMs === undefined) return undefined;
+    this.reviewDurations.delete(toolCallId);
+    return durationMs;
+  }
+
   handleToolResultMessage(message: ToolResultMessage): { message: ToolResultMessage } | undefined {
     const usage = this.pendingUsage.get(message.toolCallId);
     if (!usage) return undefined;
@@ -1086,8 +1115,24 @@ export class AutoReviewController {
   }
 }
 
+type ReviewedEntryData = { durationMs: number };
+
+// Sits directly under a reviewed tool call's result line, matching that
+// line's two-space indent so it reads as an annotation on it, not a new item.
+export function renderReviewedEntry(
+  entry: CustomEntry<ReviewedEntryData>,
+  _options: EntryRenderOptions,
+  theme: Theme,
+): Component | undefined {
+  const durationMs = entry.data?.durationMs;
+  if (typeof durationMs !== "number") return undefined;
+  return new Text(`  ${theme.fg("dim", `⛨ reviewed · ${formatReviewDuration(durationMs)}`)}`, 0, 0);
+}
+
 export default function autoReview(pi: ExtensionAPI) {
   const controller = new AutoReviewController();
+
+  pi.registerEntryRenderer<ReviewedEntryData>(REVIEWED_ENTRY_TYPE, renderReviewedEntry);
 
   pi.registerCommand(COMMAND_NAME, {
     description: "Show or control the Guardian review gate",
@@ -1113,6 +1158,12 @@ export default function autoReview(pi: ExtensionAPI) {
 
   pi.on("tool_call", async (event, ctx) => controller.handleToolCall(event, ctx as ReviewContext));
   pi.on("tool_result", async (event) => controller.handleToolResult(event));
+  pi.on("tool_result", async (event) => {
+    const durationMs = controller.takeReviewDuration(event.toolCallId);
+    if (durationMs === undefined) return undefined;
+    pi.appendEntry<ReviewedEntryData>(REVIEWED_ENTRY_TYPE, { durationMs });
+    return undefined;
+  });
   pi.on("message_end", async (event) => {
     if (event.message.role !== "toolResult") return undefined;
     return controller.handleToolResultMessage(event.message);

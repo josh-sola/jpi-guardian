@@ -47,6 +47,10 @@ command list — or the reviewer still sees the call.
 Reviewer failures (timeouts, errors, bad output) count separately from
 denials and fail closed: the agent gets one retry, then the run stops.
 
+When the reviewer actually ran and allowed a call, the transcript shows a
+dim `⛨ reviewed · <duration>` line under that call's result. Allowlisted,
+scratchpad-exempt, denied, and failed-review calls never get this line.
+
 Run `/guardian status` in a Pi session to see whether the gate is on, and
 `/guardian on`, `/guardian off`, or `/guardian reload` to control it
 for the current session.

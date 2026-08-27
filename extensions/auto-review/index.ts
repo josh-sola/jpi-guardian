@@ -704,11 +704,28 @@ async function buildScriptSection(command: string, cwd: string): Promise<string 
       remaining -= content.length;
     }
 
-    if (sections.length === 0) return undefined;
-    return [
-      "Script contents (read by the review harness from disk, not supplied by the agent):",
-      ...sections,
-    ].join("\n\n");
+    return formatScriptSections(sections);
+  } catch {
+    return undefined;
+  }
+}
+
+function formatScriptSections(sections: string[]): string | undefined {
+  if (sections.length === 0) return undefined;
+  return [
+    "Script contents (read by the review harness from disk, not supplied by the agent):",
+    ...sections,
+  ].join("\n\n");
+}
+
+// A run call names its file exactly, so there is no token guessing: resolve
+// and read that one path.
+async function buildRunFileSection(file: string, cwd: string): Promise<string | undefined> {
+  try {
+    const target = isAbsolute(file) ? file : resolve(cwd, file);
+    const content = await readScriptFile(target, MAX_SCRIPT_TOTAL_CHARS);
+    if (content === undefined) return undefined;
+    return formatScriptSections([`--- ${target} ---\n${content}`]);
   } catch {
     return undefined;
   }
@@ -744,6 +761,11 @@ async function buildReviewRequest(
     const input: unknown = event.input;
     const command = isRecord(input) && typeof input.command === "string" ? input.command : undefined;
     const scriptSection = command ? await buildScriptSection(command, ctx.cwd) : undefined;
+    if (scriptSection) parts.push(scriptSection);
+  } else if (event.toolName === "run") {
+    const input: unknown = event.input;
+    const file = isRecord(input) && typeof input.file === "string" ? input.file : undefined;
+    const scriptSection = file ? await buildRunFileSection(file, ctx.cwd) : undefined;
     if (scriptSection) parts.push(scriptSection);
   }
 

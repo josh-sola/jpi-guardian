@@ -1209,6 +1209,159 @@ test("a bash call with no file tokens produces no script section", async (t) => 
   assert.doesNotMatch(requestText, /Script contents/);
 });
 
+test("run review requests inline a relative file's contents", async (t) => {
+  const { dir, env } = await withTempEnv(t);
+  await writeGuardianConfig(dir, '  model "openai/reviewer"');
+  const cwd = await withTempCwd(t);
+  await writeFile(join(cwd, "deploy.py"), "print('deploying')\n", "utf8");
+
+  const controller = new AutoReviewController({ env });
+  const { ctx, calls } = createContext({
+    cwd,
+    complete: async () => makeAssistant('{"decision":"allow","reason":"routine"}', makeUsage(1)),
+  });
+
+  await controller.handleToolCall(
+    {
+      type: "tool_call",
+      toolCallId: "run-relative",
+      toolName: "run",
+      input: { language: "python", file: "deploy.py" },
+    },
+    ctx,
+  );
+
+  const requestText = calls[0].context.messages[0].content[0].text;
+  assert.match(
+    requestText,
+    /Script contents \(read by the review harness from disk, not supplied by the agent\):/,
+  );
+  assert.match(requestText, /--- .*deploy\.py ---/);
+  assert.match(requestText, /print\('deploying'\)/);
+});
+
+test("run review requests inline an absolute file's contents", async (t) => {
+  const { dir, env } = await withTempEnv(t);
+  await writeGuardianConfig(dir, '  model "openai/reviewer"');
+  const cwd = await withTempCwd(t);
+  const absolutePath = join(cwd, "deploy.py");
+  await writeFile(absolutePath, "print('deploying')\n", "utf8");
+
+  const controller = new AutoReviewController({ env });
+  const { ctx, calls } = createContext({
+    cwd,
+    complete: async () => makeAssistant('{"decision":"allow","reason":"routine"}', makeUsage(1)),
+  });
+
+  await controller.handleToolCall(
+    {
+      type: "tool_call",
+      toolCallId: "run-absolute",
+      toolName: "run",
+      input: { language: "python", file: absolutePath },
+    },
+    ctx,
+  );
+
+  const requestText = calls[0].context.messages[0].content[0].text;
+  assert.match(requestText, new RegExp(`--- ${absolutePath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} ---`));
+  assert.match(requestText, /print\('deploying'\)/);
+});
+
+test("a run call with an inline script produces no script section", async (t) => {
+  const { dir, env } = await withTempEnv(t);
+  await writeGuardianConfig(dir, '  model "openai/reviewer"');
+  const cwd = await withTempCwd(t);
+
+  const controller = new AutoReviewController({ env });
+  const { ctx, calls } = createContext({
+    cwd,
+    complete: async () => makeAssistant('{"decision":"allow","reason":"routine"}', makeUsage(1)),
+  });
+
+  await controller.handleToolCall(
+    {
+      type: "tool_call",
+      toolCallId: "run-inline",
+      toolName: "run",
+      input: { language: "python", script: "print('deploying')" },
+    },
+    ctx,
+  );
+
+  const requestText = calls[0].context.messages[0].content[0].text;
+  assert.doesNotMatch(requestText, /Script contents/);
+});
+
+test("a run call with a missing file still gets reviewed, without a script section", async (t) => {
+  const { dir, env } = await withTempEnv(t);
+  await writeGuardianConfig(dir, '  model "openai/reviewer"');
+  const cwd = await withTempCwd(t);
+
+  const controller = new AutoReviewController({ env });
+  const { ctx, calls } = createContext({
+    cwd,
+    complete: async () => makeAssistant('{"decision":"allow","reason":"routine"}', makeUsage(1)),
+  });
+
+  const result = await controller.handleToolCall(
+    {
+      type: "tool_call",
+      toolCallId: "run-missing",
+      toolName: "run",
+      input: { language: "python", file: "missing.py" },
+    },
+    ctx,
+  );
+
+  assert.equal(result, undefined);
+  const requestText = calls[0].context.messages[0].content[0].text;
+  assert.doesNotMatch(requestText, /Script contents/);
+});
+
+test("run review requests skip binary and oversize files", async (t) => {
+  const { dir, env } = await withTempEnv(t);
+  await writeGuardianConfig(dir, '  model "openai/reviewer"');
+  const cwd = await withTempCwd(t);
+  await writeFile(
+    join(cwd, "bin.dat"),
+    Buffer.concat([Buffer.from("junk"), Buffer.from([0]), Buffer.from("more")]),
+  );
+  await writeFile(join(cwd, "huge.py"), "a".repeat(1_500_000), "utf8");
+
+  const controller = new AutoReviewController({ env });
+
+  const { ctx: binaryCtx, calls: binaryCalls } = createContext({
+    cwd,
+    complete: async () => makeAssistant('{"decision":"allow","reason":"routine"}', makeUsage(1)),
+  });
+  await controller.handleToolCall(
+    {
+      type: "tool_call",
+      toolCallId: "run-binary",
+      toolName: "run",
+      input: { language: "python", file: "bin.dat" },
+    },
+    binaryCtx,
+  );
+  assert.doesNotMatch(binaryCalls[0].context.messages[0].content[0].text, /Script contents/);
+
+  const { ctx: hugeCtx, calls: hugeCalls } = createContext({
+    cwd,
+    complete: async () => makeAssistant('{"decision":"allow","reason":"routine"}', makeUsage(1)),
+  });
+  await controller.handleToolCall(
+    {
+      type: "tool_call",
+      toolCallId: "run-huge",
+      toolName: "run",
+      input: { language: "python", file: "huge.py" },
+    },
+    hugeCtx,
+  );
+  assert.doesNotMatch(hugeCalls[0].context.messages[0].content[0].text, /Script contents/);
+});
+
 test("scratchpad-root writes and edits skip review while other calls stay reviewed", async (t) => {
   const { dir, env } = await withTempEnv(t);
   await writeGuardianConfig(dir, '  model "openai/reviewer"');

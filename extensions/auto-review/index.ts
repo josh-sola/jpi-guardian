@@ -296,12 +296,23 @@ export function matchesMcpServer(toolName: string, server: string): boolean {
   return false;
 }
 
+// pi-mcp-adapter's "mcp" gateway tool resolves one mode per call, and action,
+// tool, and connect outrank the metadata modes (describe, instructions,
+// search, list, status) — so only their absence guarantees a metadata-only
+// call. action also covers auth-start/auth-complete, which run an OAuth flow.
+export function isMcpGatewayIntrospection(input: unknown): boolean {
+  if (!isRecord(input)) return false;
+  return input.tool === undefined && input.connect === undefined && input.action === undefined;
+}
+
 export function isToolAllowlisted(
   config: ReviewConfig,
   event: Pick<ToolCallEvent, "toolName" | "input">,
 ): boolean {
   if (config.allowTools.includes(event.toolName)) return true;
   if (config.readonly && BUILT_IN_READONLY_TOOLS.has(event.toolName)) return true;
+  if (config.readonly && event.toolName === "mcp" && isMcpGatewayIntrospection(event.input))
+    return true;
   if (config.allowMcp.some((server) => matchesMcpServer(event.toolName, server))) return true;
   if (event.toolName !== "bash") return false;
 

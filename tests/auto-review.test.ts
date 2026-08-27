@@ -10,6 +10,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import autoReview, {
   AutoReviewController,
   buildRecentUserTranscript,
+  isMcpGatewayIntrospection,
   isScratchpadWrite,
   isToolAllowlisted,
   isWithinRoot,
@@ -362,6 +363,59 @@ test("isToolAllowlisted skips review for MCP tools from an allowlisted server", 
     isToolAllowlisted(emptyAllowMcp, { toolName: "mcp__datadog_prod", input: {} }),
     false,
   );
+});
+
+test("isMcpGatewayIntrospection allows only metadata-only gateway calls", () => {
+  assert.equal(isMcpGatewayIntrospection({ server: "datadog-prod" }), true);
+  assert.equal(isMcpGatewayIntrospection({}), true);
+  assert.equal(isMcpGatewayIntrospection({ describe: "x" }), true);
+  assert.equal(isMcpGatewayIntrospection({ instructions: "x" }), true);
+  assert.equal(isMcpGatewayIntrospection({ search: "x" }), true);
+
+  assert.equal(isMcpGatewayIntrospection({ tool: "search_logs", server: "datadog-prod" }), false);
+  assert.equal(isMcpGatewayIntrospection({ connect: "datadog-prod" }), false);
+  assert.equal(isMcpGatewayIntrospection({ action: "auth-start", server: "datadog-prod" }), false);
+  assert.equal(isMcpGatewayIntrospection(undefined), false);
+  assert.equal(isMcpGatewayIntrospection("not a record"), false);
+});
+
+test("isToolAllowlisted skips review for the mcp gateway tool's introspection modes", () => {
+  const config = {
+    allowTools: [],
+    allowBash: [],
+    allowMcp: [],
+    readonly: true,
+  } as ReviewConfig;
+
+  assert.equal(isToolAllowlisted(config, { toolName: "mcp", input: { server: "datadog-prod" } }), true);
+  assert.equal(isToolAllowlisted(config, { toolName: "mcp", input: {} }), true);
+  assert.equal(isToolAllowlisted(config, { toolName: "mcp", input: { describe: "x" } }), true);
+  assert.equal(isToolAllowlisted(config, { toolName: "mcp", input: { instructions: "x" } }), true);
+  assert.equal(isToolAllowlisted(config, { toolName: "mcp", input: { search: "x" } }), true);
+
+  assert.equal(
+    isToolAllowlisted(config, {
+      toolName: "mcp",
+      input: { tool: "search_logs", server: "datadog-prod" },
+    }),
+    false,
+  );
+  assert.equal(
+    isToolAllowlisted(config, { toolName: "mcp", input: { connect: "datadog-prod" } }),
+    false,
+  );
+  assert.equal(
+    isToolAllowlisted(config, { toolName: "mcp", input: { action: "auth-start" } }),
+    false,
+  );
+  assert.equal(isToolAllowlisted(config, { toolName: "mcp", input: undefined }), false);
+
+  const readonlyOff = { ...config, readonly: false } as ReviewConfig;
+  assert.equal(
+    isToolAllowlisted(readonlyOff, { toolName: "mcp", input: { server: "datadog-prod" } }),
+    false,
+  );
+  assert.equal(isToolAllowlisted(readonlyOff, { toolName: "mcp", input: {} }), false);
 });
 
 test("isToolAllowlisted skips review for every built-in read-only tool by default", () => {

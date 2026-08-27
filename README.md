@@ -103,6 +103,12 @@ you, set `allow.readonly` to `#false` and add explicit `allow.tool` entries
 for the rest of the list. `policy` adds trusted rules on top of the bundled
 policy (repeat the node per line); it does not replace it.
 
+The built-in read-only allowlist also covers `pi-mcp-adapter`'s `mcp` gateway
+tool, but only for its metadata modes: listing tools, status, `describe`,
+`instructions`, and `search`. Any call that names a `tool` to run, a server to
+`connect`, or an `action` (including auth) still goes through review, so
+`allow.readonly` never grants blanket access to MCP tool execution.
+
 `allow.mcp` skips review for every tool from a named MCP server — repeat the
 node per server, for example `mcp "datadog-prod"`. Use the server name as
 written in `mcp.json`; this covers both the single proxy tool Pi exposes for

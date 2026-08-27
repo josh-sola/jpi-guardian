@@ -1,32 +1,12 @@
 {
   "name": "jpi-guardian",
-  "version": "0.3.0",
-  "keywords": [
-    "pi-package"
-  ],
+  "version": "0.4.0",
+  "keywords": ["pi-package"],
   "type": "module",
-  "scripts": {
-    "test": "vp test"
-  },
-  "dependencies": {
-    "jpi-base": "github:josh-sola/jpi-base#semver:^0.7.0",
-    "tree-sitter": "^0.25.1",
-    "tree-sitter-bash": "^0.25.1"
-  },
-  "devDependencies": {
-    "vite-plus": "0.3.0"
-  },
   "peerDependencies": {
-    "@earendil-works/pi-ai": "*",
-    "@earendil-works/pi-coding-agent": "*",
-    "@earendil-works/pi-tui": "*"
-  },
-  "overrides": {
-    "vite": "npm:@voidzero-dev/vite-plus-core@0.3.0"
+    "@earendil-works/pi-coding-agent": "*"
   },
   "pi": {
-    "extensions": [
-      "./extensions"
-    ]
+    "extensions": ["./extensions"]
   }
 }

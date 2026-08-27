@@ -47,8 +47,8 @@ command list — or the reviewer still sees the call.
 Reviewer failures (timeouts, errors, bad output) count separately from
 denials and fail closed: the agent gets one retry, then the run stops.
 
-Run `/auto-review status` in a Pi session to see whether the gate is on, and
-`/auto-review on`, `/auto-review off`, or `/auto-review reload` to control it
+Run `/guardian status` in a Pi session to see whether the gate is on, and
+`/guardian on`, `/guardian off`, or `/guardian reload` to control it
 for the current session.
 
 ## Install
@@ -85,7 +85,7 @@ guardian {
 }
 ```
 
-Edit the file directly, then run `/auto-review reload` in a Pi session to
+Edit the file directly, then run `/guardian reload` in a Pi session to
 pick up the change without restarting. Set `model` to the reviewer model Pi
 should call. Keep `allow.tool` and `allow.bash` small — repeat the node for
 each entry, for example `tool "read"` or `bash "^npm test$"`. `allow.bash`
@@ -122,6 +122,17 @@ root — a lookalike sibling directory or a `..`-escape still gets reviewed.
 Bash always stays reviewed, even when a command names a scratchpad path, since
 guardian does not parse paths out of shell commands. Set `allow.scratchpad` to
 `#false` if you want scratchpad writes reviewed like everything else.
+
+## Reviewer prompt
+
+The reviewer's system prompt lives at
+`${PI_CODING_AGENT_DIR:-~/.pi/agent}/GUARDIAN.md`. Guardian writes it there
+from its bundled policy the first time it runs, if the file doesn't already
+exist. Edit it to change how the reviewer decides — your edits take effect
+on the next review, no reload needed. Delete the file to go back to the
+bundled default; guardian re-creates it before the next review. `policy`
+lines from `jpi.kdl` (above) are still appended on top of whatever
+`GUARDIAN.md` contains.
 
 ## Development
 

@@ -22,6 +22,7 @@ import autoReview, {
   stringifyBoundedJson,
 } from "../extensions/auto-review/index.ts";
 import { REVIEW_POLICY } from "../extensions/auto-review/policy.ts";
+import { buildSystemPrompt } from "../extensions/auto-review/prompt.ts";
 import { BUILT_IN_READONLY_TOOLS } from "../extensions/auto-review/readonly.ts";
 
 // ReviewContext and ReviewConfig are not exported; derive them from the
@@ -1540,7 +1541,7 @@ test("missing reviewer auth fails closed but allowlisted tools still pass", asyn
   );
   assert.equal(writeResult?.block, true);
   assert.match(writeResult!.reason!, /reviewer auth is not ready/);
-  assert.match(writeResult!.reason!, /\/auto-review reload/);
+  assert.match(writeResult!.reason!, /\/guardian reload/);
 });
 
 test("session toggles preserve pending reviewer usage", async (t) => {
@@ -1588,7 +1589,7 @@ test("extension resets breaker state at agent-run boundaries and patches final t
     },
   } as unknown as ExtensionAPI);
 
-  assert.deepEqual(commands, ["auto-review"]);
+  assert.deepEqual(commands, ["guardian"]);
   assert.ok(events.includes("before_agent_start"));
   assert.ok(events.includes("message_end"));
   assert.equal(events.includes("turn_start"), false);
@@ -1627,4 +1628,80 @@ test("commands report status, reload config, and toggle session overrides withou
     ctx,
   );
   assert.equal(disabled, undefined);
+});
+
+test("buildSystemPrompt appends trusted policy lines on top of the base prompt", () => {
+  assert.equal(buildSystemPrompt("base prompt", []), "base prompt");
+  assert.equal(
+    buildSystemPrompt("base prompt", ["one", "two"]),
+    "base prompt\n\nAdditional trusted reviewer instructions:\n- one\n- two",
+  );
+});
+
+test("seedPrompt writes GUARDIAN.md from REVIEW_POLICY when the file is absent", async (t) => {
+  const { dir, env } = await withTempEnv(t);
+  const controller = new AutoReviewController({ env });
+
+  await controller.seedPrompt();
+
+  const text = await readFile(join(dir, "GUARDIAN.md"), "utf8");
+  assert.equal(text, REVIEW_POLICY);
+});
+
+test("seedPrompt never overwrites an existing GUARDIAN.md", async (t) => {
+  const { dir, env } = await withTempEnv(t);
+  await writeFile(join(dir, "GUARDIAN.md"), "Keep me.", "utf8");
+  const controller = new AutoReviewController({ env });
+
+  await controller.seedPrompt();
+
+  const text = await readFile(join(dir, "GUARDIAN.md"), "utf8");
+  assert.equal(text, "Keep me.");
+});
+
+test("a review uses edited GUARDIAN.md content as the reviewer system prompt", async (t) => {
+  const { dir, env } = await withTempEnv(t);
+  await writeGuardianConfig(dir, '  model "openai/reviewer"');
+  await writeFile(join(dir, "GUARDIAN.md"), "Custom reviewer instructions: be extra strict.", "utf8");
+
+  const controller = new AutoReviewController({ env });
+  const { ctx, calls } = createContext({
+    complete: async () => makeAssistant('{"decision":"allow","reason":"ok"}', makeUsage(1)),
+  });
+
+  await controller.handleToolCall(
+    { type: "tool_call", toolCallId: "prompt-1", toolName: "bash", input: { command: "npm test" } },
+    ctx,
+  );
+
+  assert.equal(calls.length, 1);
+  assert.match(calls[0].context.systemPrompt, /Custom reviewer instructions: be extra strict\./);
+  assert.doesNotMatch(calls[0].context.systemPrompt, /## HARD BLOCK/);
+});
+
+test("deleting GUARDIAN.md mid-session re-seeds it before the next review", async (t) => {
+  const { dir, env } = await withTempEnv(t);
+  await writeGuardianConfig(dir, '  model "openai/reviewer"');
+  await writeFile(join(dir, "GUARDIAN.md"), "Temporary override.", "utf8");
+
+  const controller = new AutoReviewController({ env });
+  const { ctx, calls } = createContext({
+    complete: async () => makeAssistant('{"decision":"allow","reason":"ok"}', makeUsage(1)),
+  });
+
+  await controller.handleToolCall(
+    { type: "tool_call", toolCallId: "prompt-2a", toolName: "bash", input: { command: "npm test" } },
+    ctx,
+  );
+  assert.match(calls[0].context.systemPrompt, /Temporary override\./);
+
+  await rm(join(dir, "GUARDIAN.md"));
+  await controller.handleToolCall(
+    { type: "tool_call", toolCallId: "prompt-2b", toolName: "bash", input: { command: "npm test" } },
+    ctx,
+  );
+  assert.match(calls[1].context.systemPrompt, /## HARD BLOCK/);
+
+  const text = await readFile(join(dir, "GUARDIAN.md"), "utf8");
+  assert.equal(text, REVIEW_POLICY);
 });

@@ -18,6 +18,12 @@ import type {
 import { Config, j, scratchpadRoot } from "jpi-base";
 
 import { REVIEW_POLICY } from "./policy.ts";
+import {
+  buildSystemPrompt,
+  getGuardianPromptPath,
+  loadGuardianPromptBase,
+  seedIfMissing,
+} from "./prompt.ts";
 import { BUILT_IN_READONLY_TOOLS, isReadOnlyCommand } from "./readonly.ts";
 import { splitCommand } from "./split.ts";
 
@@ -30,7 +36,7 @@ interface ToolResultEventResult {
   usage?: Usage;
 }
 
-const COMMAND_NAME = "auto-review";
+const COMMAND_NAME = "guardian";
 const STATUS_KEY = "@jpi-guardian/review-mode";
 const MAX_REVIEW_TOKENS = 220;
 const MAX_TOOL_ARGS_CHARS = 40_000;
@@ -638,11 +644,6 @@ export function mergeUsage(base: Usage | undefined, extra: Usage | undefined): U
   };
 }
 
-function buildSystemPrompt(policy: string[]): string {
-  if (policy.length === 0) return REVIEW_POLICY;
-  return `${REVIEW_POLICY}\n\nAdditional trusted reviewer instructions:\n${policy.map((line) => `- ${line}`).join("\n")}`;
-}
-
 // Quoted-or-bareword split, not a shell parse: good enough to catch the
 // common "bash script.sh" / "python3 tools/run.py" shapes without building a
 // second command grammar next to split.ts's tree-sitter one.
@@ -776,6 +777,7 @@ export class AutoReviewController {
   readonly now: () => number;
   readonly reviewSessionId: string;
   readonly scratchpadRootFn: () => string;
+  readonly promptPath: string;
 
   configState: ReviewConfigState | undefined;
   sessionEnabledOverride: boolean | undefined;
@@ -792,6 +794,19 @@ export class AutoReviewController {
     this.now = options.now ?? Date.now;
     this.reviewSessionId = (options.createSessionId ?? randomUUID)();
     this.scratchpadRootFn = options.scratchpadRoot ?? scratchpadRoot;
+    this.promptPath = getGuardianPromptPath(options.env, options.homeDirectory);
+  }
+
+  // Best-effort: a failed seed here is not fatal, since loadPromptBase seeds
+  // again (and falls back to REVIEW_POLICY) on the next review.
+  async seedPrompt(): Promise<void> {
+    await seedIfMissing(this.promptPath, REVIEW_POLICY).catch(() => undefined);
+  }
+
+  async loadPromptBase(ctx: ReviewContext): Promise<string> {
+    const notify =
+      ctx.hasUI && ctx.ui ? (message: string, level: "warning") => ctx.ui!.notify(message, level) : undefined;
+    return loadGuardianPromptBase(this.promptPath, notify);
   }
 
   async reloadConfig(): Promise<ReviewConfigState> {
@@ -984,12 +999,14 @@ export class AutoReviewController {
     const timeoutSignal = AbortSignal.timeout(config.timeoutMs);
     const signal = ctx.signal ? AbortSignal.any([ctx.signal, timeoutSignal]) : timeoutSignal;
 
+    const basePrompt = await this.loadPromptBase(ctx);
+
     let response: AssistantMessage;
     try {
       response = await ctx.modelRegistry.complete(
         model,
         {
-          systemPrompt: buildSystemPrompt(config.policy),
+          systemPrompt: buildSystemPrompt(basePrompt, config.policy),
           messages: [
             {
               role: "user",
@@ -1073,13 +1090,14 @@ export default function autoReview(pi: ExtensionAPI) {
   const controller = new AutoReviewController();
 
   pi.registerCommand(COMMAND_NAME, {
-    description: "Show or control auto-review",
+    description: "Show or control the Guardian review gate",
     handler: async (args, ctx) => {
       await controller.handleCommand(args, ctx as ReviewCommandContext);
     },
   });
 
   pi.on("session_start", async (_event, ctx) => {
+    await controller.seedPrompt();
     await controller.reloadConfig();
     const status = await controller.getStatusSnapshot(ctx as ReviewContext);
     controller.applyStatus(ctx as ReviewContext, status);
